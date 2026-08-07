@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      # Offline only — no network in CI.
+      - run: python3 -m pytest
+      - run: python3 -m ruff check .
+      - run: python3 -m cow_backtester.scorer --unittest
+      - name: CLI validation
+        run: |
+          set -e
+          cow-backtester --version
+          if cow-backtester --blocks 0 2>/dev/null; then
+            echo "usage error not detected"; exit 1
+          fi
+          if cow-backtester --from-block 100 --to-block 50 2>/dev/null; then
+            echo "inverted window not detected"; exit 1
+          fi
+          echo OK
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python3 -m build
+      - run: pip install dist/*.whl
+      - run: cow-backtester --version
+      # the sdist must be self-testing (ships tests/ + fixtures/)
+      - run: |
+          pip install pytest
+          mkdir /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist
+          cd /tmp/sdist/*/ && python3 -m pytest -q

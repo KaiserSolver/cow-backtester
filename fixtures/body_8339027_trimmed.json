@@ -1,0 +1,75 @@
+{
+ "id": "8339027",
+ "tokens": {
+  "0x82af49447d8a07e3bd95bd0d56f35241523fbab1": {
+   "decimals": 18,
+   "symbol": "WETH",
+   "referencePrice": "1000000000000000000",
+   "availableBalance": "12287635329651531",
+   "trusted": false
+  },
+  "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": {
+   "decimals": 6,
+   "symbol": "USD\u20ae0",
+   "referencePrice": "522065060506477648741924864",
+   "availableBalance": "139362756",
+   "trusted": false
+  },
+  "0xaf88d065e77c8cc2239327c5edb3a432268e5831": {
+   "decimals": 6,
+   "symbol": "USDC",
+   "referencePrice": "522566719487592554773348352",
+   "availableBalance": "5415705",
+   "trusted": false
+  }
+ },
+ "orders": [
+  {
+   "uid": "0x931fc12ac39dc130a2076a982d652addba11bd07397197bd7b0e5ba397cc5c5f147945cccfbb2e332b26556ecfac37645db1ae866b0ec707",
+   "sellToken": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+   "buyToken": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+   "sellAmount": "2385464",
+   "fullSellAmount": "10000000000000",
+   "buyAmount": "2385178",
+   "fullBuyAmount": "9998500224966",
+   "validTo": 1796130567,
+   "kind": "sell",
+   "receiver": "0x147945cccfbb2e332b26556ecfac37645db1ae86",
+   "owner": "0x147945cccfbb2e332b26556ecfac37645db1ae86",
+   "partiallyFillable": true,
+   "preInteractions": [],
+   "postInteractions": [],
+   "sellTokenSource": "erc20",
+   "buyTokenDestination": "erc20",
+   "class": "limit",
+   "appData": "0x2f04af8c246588a9e73b177c282278cf1d4001cdfb78015c82d4c8533f2ef802",
+   "signingScheme": "eip712",
+   "signature": "0x6dbcff75989db24b8bc5456adcfd091bd03598903431eed81dc17b54a59e08a225f0b05fa6c97dadb804a0175c716c81d3b7d53954b034cab8e264ca3f618c911b"
+  },
+  {
+   "uid": "0xabababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+   "sellToken": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+   "buyToken": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+   "sellAmount": "1000000000000000000",
+   "fullSellAmount": "1000000000000000000",
+   "buyAmount": "3000000000",
+   "fullBuyAmount": "3000000000",
+   "validTo": 1796130567,
+   "kind": "sell",
+   "receiver": "0x147945cccfbb2e332b26556ecfac37645db1ae86",
+   "owner": "0x147945cccfbb2e332b26556ecfac37645db1ae86",
+   "partiallyFillable": true,
+   "preInteractions": [],
+   "postInteractions": [],
+   "sellTokenSource": "erc20",
+   "buyTokenDestination": "erc20",
+   "class": "limit",
+   "appData": "0x2f04af8c246588a9e73b177c282278cf1d4001cdfb78015c82d4c8533f2ef802",
+   "signingScheme": "eip712",
+   "signature": "0x6dbcff75989db24b8bc5456adcfd091bd03598903431eed81dc17b54a59e08a225f0b05fa6c97dadb804a0175c716c81d3b7d53954b034cab8e264ca3f618c911b"
+  }
+ ],
+ "surplusCapturingJitOrderOwners": [],
+ "effectiveGasPrice": "21294000",
+ "deadline": "2026-08-06T15:11:14.566395390Z"
+}

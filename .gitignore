@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.jsonl
+.cowbt-cache/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/

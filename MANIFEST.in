@@ -1,0 +1,5 @@
+graft fixtures
+graft tests
+include mock_solver.py
+include CHANGELOG.md CONTRIBUTING.md LICENSE requirements.txt
+global-exclude __pycache__ *.pyc
