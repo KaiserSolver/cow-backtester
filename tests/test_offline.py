@@ -411,3 +411,87 @@ def test_report_render_utf8(tmp_path):
     html = out.read_text(encoding="utf-8")     # must be valid UTF-8
     assert "wΞth-&gt;ust💱" in html or "wΞth" in html   # symbols escaped, not mojibake
     assert "charset='utf-8'" in html
+
+
+# -------------------------------------------------------------- readiness mode
+
+class _Args:
+    """Minimal args stand-in for readiness_report (no network, no argparse)."""
+    def __init__(self, solvers, chain="base", env="prod", solve_timeout=15, quiet=True):
+        self.solvers = solvers
+        self.chain = chain
+        self.env = env
+        self.solve_timeout = solve_timeout
+        self.quiet = quiet
+
+
+def _st(per_solver, frm=1000, to=2000):
+    return {"per_solver": per_solver, "from_block": frm, "to_block": to}
+
+
+def _solver_stat(**over):
+    base = {"replayed": 0, "errored": 0, "returned": 0, "valid": 0, "positive": 0,
+            "beat": 0, "our_surplus": 0, "winner_surplus": 0, "implausible": 0,
+            "invalid": __import__("collections").Counter(),
+            "errors": __import__("collections").Counter(), "latency": [], "late": 0}
+    base.update(over)
+    return base
+
+
+def test_readiness_healthy_endpoint_is_ready():
+    # 20 auctions, all answered/valid, fast, competitive → READY, all checks ok.
+    s = _solver_stat(replayed=20, returned=20, valid=20, positive=18,
+                     our_surplus=6 * 10**17, winner_surplus=10**18,
+                     latency=[180] * 19 + [900])
+    args = _Args([{"name": "mine", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"mine": s}), args)[0]
+    assert rep["verdict"] == "READY"
+    assert rep["answer_rate_pct"] == 100.0
+    assert rep["capture_pct"] == 60.0
+    assert rep["p50_ms"] == 180 and rep["past_deadline"] == 0
+    assert all(c["level"] == "ok" for c in rep["checks"])
+
+
+def test_readiness_never_answered_is_not_ready():
+    s = _solver_stat(errored=15, latency=[10] * 15,
+                     errors=__import__("collections").Counter({"timeout": 15}))
+    args = _Args([{"name": "dead", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"dead": s}), args)[0]
+    assert rep["verdict"] == "NOT READY"
+    assert rep["answer_rate_pct"] == 0.0
+    assert any(c["level"] == "fail" for c in rep["checks"])
+
+
+def test_readiness_slow_but_answering_is_review():
+    # answers + valid, but p95 blows the whole budget and some go past deadline.
+    budget_ms = 15 * 1000
+    s = _solver_stat(replayed=20, returned=20, valid=20, positive=20,
+                     our_surplus=8 * 10**17, winner_surplus=10**18,
+                     latency=[budget_ms - 100] * 20, late=1)
+    args = _Args([{"name": "slow", "url": "http://x"}], solve_timeout=15)
+    rep = backtest.readiness_report(_st({"slow": s}), args)[0]
+    assert rep["verdict"] == "REVIEW"          # warns, no hard fail
+    assert rep["past_deadline"] == 1
+    assert not any(c["level"] == "fail" for c in rep["checks"])
+    assert any(c["level"] == "warn" for c in rep["checks"])
+
+
+def test_readiness_implausible_prices_flagged():
+    s = _solver_stat(replayed=10, returned=10, valid=10, positive=10, implausible=3,
+                     our_surplus=10**18, winner_surplus=10**18, latency=[100] * 10)
+    args = _Args([{"name": "sus", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"sus": s}), args)[0]
+    assert rep["implausible"] == 3
+    assert any(c["label"] == "prices look plausible" and c["level"] == "warn"
+               for c in rep["checks"])
+    assert rep["verdict"] == "REVIEW"
+
+
+def test_readiness_report_is_json_serializable():
+    s = _solver_stat(replayed=5, returned=5, valid=4, our_surplus=3 * 10**17,
+                     winner_surplus=10**18, latency=[120, 200, 90, 300, 150],
+                     errors=__import__("collections").Counter({"bad_solver_response": 1}))
+    args = _Args([{"name": "mine", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"mine": s}), args)
+    json.dumps(rep)   # must not raise — it lands in the summary JSON/HTML
+    assert rep[0]["errors"] == {"bad_solver_response": 1}

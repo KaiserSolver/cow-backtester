@@ -764,6 +764,97 @@ def _pct(a, b):
     return None if not b else 100 * a / b
 
 
+def readiness_report(st, args):
+    """A one-screen pre-production readiness check for a single solver endpoint:
+    did it answer, how fast, and were its solutions sane against the winners?
+    Reuses the counterfactual pass's per-solver stats — no extra fetching.
+    Returns a JSON-able dict; also prints the report unless --quiet."""
+    reports = []
+    for sv in args.solvers:
+        s = st["per_solver"][sv["name"]]
+        attempted = s["replayed"] + s["errored"]
+        lat = sorted(s["latency"])
+        p50 = lat[len(lat) // 2] if lat else None
+        p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else None
+        pmax = lat[-1] if lat else None
+        answer_rate = _pct(s["returned"], attempted)
+        valid_rate = _pct(s["valid"], s["replayed"])
+        capture = _pct(s["our_surplus"], s["winner_surplus"])
+        # A conservative pass/warn read for a first-time integrator.
+        checks = []
+
+        def chk(ok, warn, label, detail, _out=checks):
+            _out.append({"level": "ok" if ok else ("warn" if warn else "fail"),
+                         "label": label, "detail": detail})
+        chk(attempted > 0, False, "reached auctions",
+            f"{attempted} auctions attempted")
+        if attempted:
+            chk(s["errored"] == 0, s["errored"] < attempted, "no transport errors",
+                f"{s['errored']}/{attempted} errored" if s["errored"] else "0 errors")
+            chk((answer_rate or 0) >= 90, (answer_rate or 0) >= 50, "answers reliably",
+                f"{answer_rate:.0f}% returned a solution" if answer_rate is not None else "n/a")
+            chk(s["late"] == 0, s["late"] * 5 <= attempted, "inside the deadline",
+                f"{s['late']} past the advertised deadline"
+                if s["late"] else "0 past deadline")
+            if p95 is not None:
+                budget = args.solve_timeout * 1000
+                chk(p95 <= budget * 0.5, p95 <= budget, "latency headroom",
+                    f"p95 {p95} ms of a {budget} ms budget")
+            if s["replayed"]:
+                chk((valid_rate or 0) >= 90, (valid_rate or 0) >= 50, "solutions are valid",
+                    f"{valid_rate:.0f}% passed limit/fee checks" if valid_rate is not None else "n/a")
+                chk((capture or 0) >= 50, (capture or 0) > 0, "competitive vs winners",
+                    f"{capture:.0f}% of winner surplus captured" if capture is not None else "n/a")
+            if s["implausible"]:
+                chk(False, True, "prices look plausible",
+                    f"{s['implausible']} auction(s) flagged implausible_surplus")
+        verdict = ("READY" if all(c["level"] == "ok" for c in checks)
+                   else "NOT READY" if any(c["level"] == "fail" for c in checks)
+                   else "REVIEW")
+        rep = {
+            "solver": sv["name"], "url": sv["url"], "verdict": verdict,
+            "auctions_attempted": attempted, "answered": s["returned"],
+            "answer_rate_pct": answer_rate, "errored": s["errored"],
+            "valid_rate_pct": valid_rate, "capture_pct": capture,
+            "p50_ms": p50, "p95_ms": p95, "max_ms": pmax,
+            "past_deadline": s["late"], "solve_timeout_s": args.solve_timeout,
+            "implausible": s["implausible"], "checks": checks,
+            "errors": dict(s["errors"]),
+        }
+        reports.append(rep)
+        if args.quiet:
+            continue
+        mark = {"ok": "PASS", "warn": "WARN", "fail": "FAIL"}
+        print()
+        print("=" * 68)
+        print(f"  READINESS — {sv['name']}   [{verdict}]")
+        print(f"  {args.chain} · {args.env} · blocks {st['from_block']}..{st['to_block']}")
+        print("=" * 68)
+        for c in checks:
+            print(f"  [{mark[c['level']]}] {c['label']:<24} {c['detail']}")
+        print("  " + "-" * 64)
+        print(f"  answered            : {s['returned']}/{attempted}"
+              + (f"  ({answer_rate:.0f}%)" if answer_rate is not None else ""))
+        if p50 is not None:
+            print(f"  latency             : p50 {p50} ms / p95 {p95} ms / max {pmax} ms"
+                  f"   (budget {args.solve_timeout * 1000} ms)")
+        if capture is not None:
+            print(f"  surplus vs winners  : {capture:.0f}% captured"
+                  f"   ({s['valid']}/{s['replayed']} valid)")
+        if s["errors"]:
+            print(f"  errors              : {dict(s['errors'])}")
+        print()
+        print("  Reproduce this run:")
+        blk = f"--from-block {st['from_block']} --to-block {st['to_block']}"
+        print(f"    cow-backtester --chain {args.chain} --env {args.env} {blk} \\")
+        print(f"        --rpc-url <rpc> --solver-url {sv['url']} --solver-name {sv['name']} --readiness")
+    if not args.quiet:
+        print()
+        print("  Note: replays live liquidity against archived auctions — a readiness")
+        print("  signal, not a settlement guarantee. Pair with self-hosted shadow before prod.")
+    return reports
+
+
 def print_scorecard(st, args, cache, solver_names_map=None):
     nat = st["native"]
     rows = st["rows"]
@@ -963,6 +1054,7 @@ def build_summary(st, args, extra, solver_names_map=None):
                     if st["field_by_bucket"].get(lb, [0, 0])[0]],
         "solvers": solvers, "solver_names": [s["name"] for s in args.solvers],
         "head_to_head": extra.get("head_to_head"), "pairs": extra.get("pairs"),
+        "readiness": extra.get("readiness"),
         "submitters": [{"address": a, "name": (solver_names_map or {}).get(a),
                         "settlements": v["settlements"], "surplus_wei": v["surplus_wei"]}
                        for a, v in sorted(st["submitters"].items(),
@@ -1005,6 +1097,10 @@ def main():
     ap.add_argument("--html-out", default=None, help="write a single-file HTML report")
     ap.add_argument("--solver-map", default=None,
                     help="JSON {address: name} to label winning submitters")
+    ap.add_argument("--readiness", action="store_true",
+                    help="print a one-screen pre-prod readiness check for the "
+                         "solver endpoint(s) instead of the full field scorecard "
+                         "(answer rate, latency, validity, surplus vs winners)")
     ap.add_argument("--verify-api", action="store_true",
                     help="cross-check winner txs against the v2 competition API")
     ap.add_argument("--clamp-validto", action="store_true",
@@ -1119,7 +1215,14 @@ def main():
             say("\n" + "#" * 68 + f"\n# watch cycle {cycle}\n" + "#" * 68)
         st = process_window(args, rpcs, cfg, frm, to, cache, jout)
         was_interrupted = was_interrupted or st["interrupted"]
-        extra = print_scorecard(st, args, cache, solver_names_map)
+        if args.readiness and args.solvers:
+            readiness = readiness_report(st, args)
+            extra = {"readiness": readiness}
+        else:
+            if args.readiness:
+                say("  --readiness needs at least one --solver-url; "
+                    "printing the field scorecard instead.")
+            extra = print_scorecard(st, args, cache, solver_names_map)
 
         if args.html_out:
             from . import report

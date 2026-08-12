@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 — 2026-08-12
+
+- `--readiness`: a one-screen pre-production readiness check for a solver
+  endpoint. Replays recent auctions against the endpoint and reports answer
+  rate, latency (p50/p95/max vs the solve budget), solution validity, and
+  surplus captured against the on-chain winners, with a READY / REVIEW /
+  NOT READY verdict and a copy-paste command to reproduce the exact run.
+  A focused alternative to the full field scorecard for anyone evaluating a
+  solver before staging or shadow. Emitted in the `--json-out`/`--html-out`
+  summary under `readiness`.
+
 ## 0.6.0 — 2026-08-07
 
 First public release.

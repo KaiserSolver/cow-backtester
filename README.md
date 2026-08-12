@@ -44,6 +44,42 @@ From a source checkout without installing, `python3 -m cow_backtester ...`
 works identically. Your endpoint only needs the standard CoW solver-engine
 API (`POST /solve`).
 
+## Readiness check
+
+If you are bringing up a new solver and want a fast "is this endpoint healthy
+enough to face production auctions?" read, `--readiness` prints a one-screen
+report instead of the full field scorecard:
+
+```bash
+cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc> \
+        --solver-url http://localhost:8080 --solver-name mine --readiness
+```
+
+It replays recent auctions against your endpoint and reports the four things
+that gate a pre-prod solver — does it answer, is it fast enough, are its
+solutions valid, and are they competitive with the on-chain winners — as
+pass/warn checks with a `READY` / `REVIEW` / `NOT READY` verdict:
+
+```
+====================================================================
+  READINESS — mine   [REVIEW]
+  base · prod · blocks 49506127..49510000
+====================================================================
+  [PASS] reached auctions         50 auctions attempted
+  [WARN] no transport errors      2/50 errored
+  [PASS] answers reliably         96% returned a solution
+  [PASS] inside the deadline      0 past deadline
+  [PASS] latency headroom         p95 420 ms of a 15000 ms budget
+  [PASS] solutions are valid      98% passed limit/fee checks
+  [PASS] competitive vs winners   61% of winner surplus captured
+```
+
+It prints the exact `--from-block/--to-block` command to reproduce the run,
+and the same data lands in `--json-out`/`--html-out` under `readiness`. Works
+on any of the supported chains, so you can readiness-check an endpoint for a
+chain you are not yet onboarded on. It is a signal, not a settlement
+guarantee — pair it with a self-hosted shadow run before going to production.
+
 ### Try it without a solver
 
 The bundled mock solver lets you see the full counterfactual/A/B output in
