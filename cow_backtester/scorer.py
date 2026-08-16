@@ -192,6 +192,11 @@ def fetch_settlement(rpc_urls, tx_hash):
     return {
         "calldata": t["input"],
         "from": t.get("from", "").lower(),
+        # tx.to distinguishes wrapper entrypoints (solver-owned router
+        # contracts) from direct settle() calls, and doubles as the solver
+        # identity for wrapper-routed settlements (their tx.from is a
+        # throwaway relayer EOA).
+        "to": (t.get("to") or "").lower(),
         "block": int(t["blockNumber"], 16),
         "gas_used": int(rc["gasUsed"], 16),
         "eff_gas_price": int(rc.get("effectiveGasPrice", "0x0"), 16),
@@ -227,6 +232,81 @@ def trade_events(logs):
             "uid": ("0x" + d[448:560]).lower(),
         })
     return out
+
+
+def wrapper_settlement_surplus(events, body, ref_prices):
+    """Surplus of a WRAPPER-routed settlement, from Trade events alone.
+
+    Wrapper entrypoints (solver router contracts; ~40% of Base/mainnet
+    settlements, Aug 2026) hide the inner settle() calldata, so uniform
+    clearing prices and calldata limits are unavailable. This scores the
+    DELIVERED execution — the Trade event's executed amounts, i.e. custom
+    prices, after the settlement's fee take — against the auction body's
+    signed limits, valued at referencePrice.
+
+    Basis note: this UNDER-states the direct-path basis (uniform prices,
+    before-fee) by exactly the per-trade fee wedge, typically a few bps.
+    Rows built from it are tagged entry='wrapper' so consumers can tell the
+    bases apart; the alternative was deleting these settlements entirely,
+    which mis-sized the field by ~40% with a 12x size bias.
+
+    Rounding matches the direct path: `gross_surplus_atoms` is reused with
+    the event's own executed pair substituted as the price ratio, so for a
+    sell order it degenerates to `buy_amount - ceil(executed*limit)` — the
+    same ceil/floor conventions as the official math.
+
+    JIT trades (uid not in the body) cannot be scored without calldata
+    limits and are tallied under jit_excluded, including surplus-capturing
+    ones — a small stated under-count, never a misattribution.
+    """
+    by_uid = {o["uid"].lower(): o for o in body.get("orders", [])}
+    total = 0
+    per_trade = []
+    skipped_no_refprice = 0
+    jit_excluded = 0
+    anomalies = 0
+    for ev in events:
+        o = by_uid.get(ev["uid"])
+        if o is None:
+            jit_excluded += 1
+            continue
+        kind = "buy" if o.get("kind") == "buy" else "sell"
+        limit_sell = to_u256_str(o.get("fullSellAmount") or o.get("sellAmount"))
+        limit_buy = to_u256_str(o.get("fullBuyAmount") or o.get("buyAmount"))
+        executed = ev["sell_amount"] if kind == "sell" else ev["buy_amount"]
+        # Substituting the executed pair as the price ratio makes
+        # gross_surplus_atoms return delivered-vs-limit with identical
+        # rounding: sell -> buy_amount - ceil(executed*limit_buy/limit_sell).
+        s_atoms = gross_surplus_atoms(kind, executed, limit_sell, limit_buy,
+                                      ev["buy_amount"], ev["sell_amount"])
+        if s_atoms < 0:
+            anomalies += 1
+            s_atoms = 0
+        stok = surplus_token(kind, ev["sell_token"], ev["buy_token"])
+        ref = ref_prices.get(stok)
+        if ref is None:
+            skipped_no_refprice += 1
+            per_trade.append({"uid": ev["uid"], "owner": ev["owner"],
+                              "sell": ev["sell_token"], "buy": ev["buy_token"],
+                              "kind": kind, "executed": executed,
+                              "surplus_wei": None, "fee_wei": None})
+            continue
+        s_wei = to_native(s_atoms, ref)
+        total += s_wei
+        per_trade.append({"uid": ev["uid"], "owner": ev["owner"],
+                          "sell": ev["sell_token"], "buy": ev["buy_token"],
+                          "kind": kind, "executed": executed,
+                          "surplus_wei": s_wei, "fee_wei": None})
+    return {"total_surplus_wei": total, "total_fee_wei": 0,
+            "per_trade": per_trade, "jit_excluded": jit_excluded,
+            "skipped_no_refprice": skipped_no_refprice, "anomalies": anomalies}
+
+
+def to_u256_str(v):
+    """Body amounts arrive as decimal strings; tolerate ints. None -> 0."""
+    if v is None:
+        return 0
+    return int(v) if not isinstance(v, str) else int(v, 16) if v.startswith("0x") else int(v)
 
 
 def winner_settlement_surplus(decoded, events, body, ref_prices):

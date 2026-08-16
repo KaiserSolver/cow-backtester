@@ -256,11 +256,18 @@ two-solver run) without changing a single number. Delete `.cowbt-cache` any time
   block (each row carries `block`), and treat this tool as the scorer.
 * **The S3 bucket retains roughly one month** of auctions (measured Aug 2026).
   This is a recent-window backtester, not an archive.
-* **Entrypoint coverage.** The winner join uses the auction id appended to
-  `settle()` calldata. Settlements routed through other entrypoints (solver
-  routers) can't be attributed and are counted under `non_settle_entrypoint`:
-  roughly 15-20% on Arbitrum and Base (measured Aug 2026; mainnet is higher). The scored set is a representative
-  sample, not the entire field.
+* **Entrypoint coverage.** Direct `settle()` calls are attributed by the
+  auction id appended to their calldata. Wrapper-routed settlements (solver
+  router contracts — measured Aug 2026 at **~43% of mainnet, ~40% of Base,
+  ~2% of Arbitrum** settlements, and *larger* than direct ones at the median,
+  so they are not a random slice) are attributed via the v2
+  `solver_competition/by_tx_hash` endpoint and **proven by uid overlap with
+  the S3 auction body** before scoring; they score on a DELIVERED basis
+  (Trade events vs signed limits), which understates the direct-path
+  before-fee basis by the settlement's fee wedge (typically a few bps) —
+  rows carry `entry: "wrapper"` so the bases are distinguishable. Settlements
+  the endpoint cannot resolve are counted under `wrapper_unattributed` and
+  disclosed in the coverage block, `--readiness`, and the `_meta` JSON line.
 * **"Beat the winning set" is necessary, not sufficient.** Real winner
   selection also applies fairness filters, and bids score net of gas; the tool
   also takes your solutions at face value while the driver merges and simulates.

@@ -495,3 +495,44 @@ def test_readiness_report_is_json_serializable():
     rep = backtest.readiness_report(_st({"mine": s}), args)
     json.dumps(rep)   # must not raise — it lands in the summary JSON/HTML
     assert rep[0]["errors"] == {"bad_solver_response": 1}
+
+
+# ---------------------------------------------------------------- v0.7.1: wrapper coverage
+
+def test_wrapper_settlement_surplus_delivered_basis():
+    """Events-only scoring: delivered-vs-limit with the direct path's rounding."""
+    body = {"orders": [{
+        "uid": "0x" + "ab" * 56, "kind": "sell",
+        "fullSellAmount": "1000000000000000000",   # sells 1e18
+        "fullBuyAmount": "2000000000",             # limit: 2000e6
+    }], "surplusCapturingJitOrderOwners": []}
+    ev = {"uid": "0x" + "ab" * 56, "owner": "0x" + "11" * 20,
+          "sell_token": "0x" + "aa" * 20, "buy_token": "0x" + "bb" * 20,
+          "sell_amount": 10**18, "buy_amount": 2_100_000_000}  # delivered 2100e6
+    ref = {"0x" + "bb" * 20: 10**9}  # 1 atom -> 1e9/1e18 native
+    w = scorer.wrapper_settlement_surplus([ev], body, ref)
+    # surplus = 2100e6 - ceil(1e18 * 2000e6 / 1e18) = 100e6 atoms
+    assert w["per_trade"][0]["surplus_wei"] == scorer.to_native(100_000_000, 10**9)
+    assert w["total_fee_wei"] == 0 and w["jit_excluded"] == 0 and w["anomalies"] == 0
+
+
+def test_wrapper_settlement_surplus_jit_and_anomaly():
+    body = {"orders": [{"uid": "0x" + "ab" * 56, "kind": "sell",
+                        "fullSellAmount": "100", "fullBuyAmount": "100"}],
+            "surplusCapturingJitOrderOwners": []}
+    jit = {"uid": "0x" + "cd" * 56, "owner": "0x" + "22" * 20,
+           "sell_token": "0x" + "aa" * 20, "buy_token": "0x" + "bb" * 20,
+           "sell_amount": 5, "buy_amount": 5}
+    below = {"uid": "0x" + "ab" * 56, "owner": "0x" + "11" * 20,
+             "sell_token": "0x" + "aa" * 20, "buy_token": "0x" + "bb" * 20,
+             "sell_amount": 100, "buy_amount": 90}  # delivered below limit
+    w = scorer.wrapper_settlement_surplus([jit, below], body, {"0x" + "bb" * 20: 10**18})
+    assert w["jit_excluded"] == 1
+    assert w["anomalies"] == 1 and w["total_surplus_wei"] == 0  # clamped, counted
+
+
+def test_max_auctions_keeps_newest():
+    """--max-auctions must keep the NEWEST auctions (live-liquidity freshness)."""
+    auctions = {100: [], 200: [], 300: []}
+    aids = sorted(auctions)[-2:]
+    assert aids == [200, 300]

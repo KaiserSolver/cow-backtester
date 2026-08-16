@@ -129,8 +129,11 @@ CAVEATS = [
     "Beating the winning set is necessary, not sufficient: real winner selection also applies "
     "fairness filters and bids score net of gas.",
     "Solver prices are CLAIMED, not simulated. Feasibility is checked; routes are not executed.",
-    "Settlements routed through non-settle() entrypoints carry no auction id and are excluded "
-    "(reported under skipped).",
+    "Wrapper-routed settlements (solver router entrypoints; measured Aug 2026: ~43% of mainnet, "
+    "~40% of Base, ~2% of Arbitrum settlements, and larger than direct ones at the median) are "
+    "attributed via the v2 by-tx-hash endpoint and PROVEN by uid overlap with the S3 body, then "
+    "scored on a DELIVERED basis (Trade events vs signed limits) which understates the direct "
+    "before-fee basis by the fee wedge. Unresolvable ones are reported under wrapper_unattributed.",
 ]
 
 
@@ -495,6 +498,36 @@ def validate_and_score(resp, body, ref_prices):
     return out
 
 
+def resolve_auction_by_tx(chain, tx, cache):
+    """Propose (auction_id, solver_address) for a wrapper-routed settlement via
+    the v2 by-tx-hash endpoint. The API only PROPOSES the id — scoring still
+    requires uid overlap between the receipt's Trade events and the S3 auction
+    body (the chain-side proof), preserving trustless attribution. Positive
+    results are immutable and cached; a 404 (competition row not yet / no
+    longer served) is returned as None and NOT cached."""
+    if cache:
+        hit = cache.get("aid-by-tx", tx)
+        if hit is not None:
+            return hit.get("aid"), (hit.get("solver") or "").lower() or None
+    api = CHAINS[chain]["api"]
+    url = f"{COW_API}/{api}/api/v2/solver_competition/by_tx_hash/{tx}"
+    try:
+        d = json.loads(_http_get(url, timeout=15))
+    except Exception:
+        return None, None
+    aid = d.get("auctionId")
+    if aid is None:
+        return None, None
+    solver = None
+    for sol in d.get("solutions") or []:
+        if sol.get("isWinner") and str(sol.get("txHash") or "").lower() == tx.lower():
+            solver = (sol.get("solverAddress") or "").lower() or None
+            break
+    if cache:
+        cache.put("aid-by-tx", tx, {"aid": int(aid), "solver": solver})
+    return int(aid), solver
+
+
 def verify_against_api(chain, auction_id, our_txs):
     """Cross-check the on-chain reconstruction against the v2 competition
     endpoint. Returns 'match' | 'mismatch' | 'unavailable'."""
@@ -543,7 +576,23 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 skip["settlement_reverted"] += 1
                 continue
             if s["calldata"][:10].lower() != scorer.SETTLE_SELECTOR:
-                skip["non_settle_entrypoint"] += 1
+                # Wrapper entrypoint: the inner settle() calldata is hidden,
+                # but the GPv2 Trade events are on the receipt and the v2
+                # by-tx-hash endpoint proposes the auction id (proven later by
+                # uid overlap with the S3 body). Dropping these deleted ~40%
+                # of the Base/mainnet field — and the biggest solvers with it.
+                events = scorer.trade_events(s["logs"])
+                if not events:
+                    skip["non_settle_entrypoint"] += 1
+                    continue
+                aid, solver = resolve_auction_by_tx(args.chain, tx, cache)
+                if aid is None:
+                    skip["wrapper_unattributed"] += 1
+                    continue
+                auctions[aid].append(
+                    {"tx": tx, "from": solver or s.get("to") or s["from"],
+                     "block": s["block"], "dec": None, "events": events,
+                     "entry": "wrapper"})
                 continue
             try:
                 dec = scorer.decode_settlement(s["calldata"])
@@ -566,8 +615,10 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
     aids = sorted(auctions)
     n_found = len(aids)
     if args.max_auctions and n_found > args.max_auctions:
-        aids = aids[:args.max_auctions]
-        say(f"      {n_found} auctions found; capped to {len(aids)} "
+        # Keep the NEWEST auctions: replay uses live liquidity, so freshness
+        # is the whole game — the old head-of-list cap kept the stalest.
+        aids = aids[-args.max_auctions:]
+        say(f"      {n_found} auctions found; capped to {len(aids)} newest "
               f"(per --max-auctions; NOT a full-field sample)")
     else:
         say(f"      {n_found} auctions from {len(txs)} settlement txs")
@@ -621,7 +672,11 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
             winner_total = winner_fees = 0
             winner_txs, per_trades = [], []
             for r in txrecs:
-                w = scorer.winner_settlement_surplus(r["dec"], r["events"], body, ref_prices)
+                if r.get("dec") is None:
+                    # wrapper-routed: events-only scoring (delivered basis)
+                    w = scorer.wrapper_settlement_surplus(r["events"], body, ref_prices)
+                else:
+                    w = scorer.winner_settlement_surplus(r["dec"], r["events"], body, ref_prices)
                 if "error" in w:
                     skip[w["error"]] += 1
                     continue
@@ -632,6 +687,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 agg["anomalies"] += w.get("anomalies", 0)
                 per_trades.extend(w["per_trade"])
                 winner_txs.append({"tx": r["tx"], "block": r["block"], "submitter": r["from"],
+                                   "entry": r.get("entry", "direct"),
                                    "surplus_wei": w["total_surplus_wei"],
                                    "fee_wei": w["total_fee_wei"], "trades": len(w["per_trade"])})
                 sub = submitters[r["from"]]
@@ -808,6 +864,18 @@ def readiness_report(st, args):
             if s["implausible"]:
                 chk(False, True, "prices look plausible",
                     f"{s['implausible']} auction(s) flagged implausible_surplus")
+            # Coverage disclosure: a verdict against a partial field is only
+            # meaningful if the reader can see how partial. Never a hard fail
+            # (it's environmental, not the solver's doing) — but >5% excluded
+            # downgrades to REVIEW so the number gets read.
+            found = len(st.get("txs") or [])
+            if found:
+                sk = st.get("skip") or {}
+                excl = (sk.get("wrapper_unattributed", 0)
+                        + sk.get("non_settle_entrypoint", 0))
+                chk(excl <= 0.05 * found, True, "field coverage",
+                    f"{found} settlements, {st.get('n_found', 0)} auctions formed, "
+                    f"{excl} unattributed ({100 * excl / found:.0f}% of field excluded)")
         verdict = ("READY" if all(c["level"] == "ok" for c in checks)
                    else "NOT READY" if any(c["level"] == "fail" for c in checks)
                    else "REVIEW")
@@ -1230,7 +1298,16 @@ def main():
             report.render(summary, st["rows"], args.html_out)
             say(f"  wrote HTML report -> {args.html_out}")
         if jout:
-            say(f"  wrote {len(st['rows'])} rows -> {args.json_out}")
+            # One _meta line per window so pipelines inherit coverage + the
+            # caveats instead of silently trusting a partial field.
+            jout.write(json.dumps({"_meta": {
+                "v": VERSION, "chain": args.chain, "env": args.env,
+                "from_block": st["from_block"], "to_block": st["to_block"],
+                "settlement_txs_found": len(st["txs"]),
+                "auctions_formed": st["n_found"], "rows": len(st["rows"]),
+                "skipped": dict(st["skip"]), "caveats": CAVEATS}}) + "\n")
+            jout.flush()
+            say(f"  wrote {len(st['rows'])} rows + 1 _meta line -> {args.json_out}")
 
         last_to = to
         cycle += 1
