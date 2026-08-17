@@ -49,7 +49,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from . import scorer
+from . import competition, scorer
 from .cache import Cache
 from .scorer import VERSION, _ceildiv
 
@@ -166,9 +166,19 @@ def to_u256(v):
     return n
 
 
+# Hard ceiling on any single HTTP body. Real payloads top out around a few
+# MB gzip'd (largest observed competition record ~170 KB, S3 bodies a few MB);
+# without a cap a rogue endpoint can exhaust memory (audit hardening item).
+_MAX_HTTP_BYTES = 64 * 1024 * 1024
+
+
 def _http_get(url, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": f"cow-backtester/{VERSION}"})
-    return urllib.request.urlopen(req, timeout=timeout).read()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(_MAX_HTTP_BYTES + 1)
+    if len(data) > _MAX_HTTP_BYTES:
+        raise ValueError(f"response exceeds {_MAX_HTTP_BYTES} bytes: {url.split('?')[0]}")
+    return data
 
 
 def s3_auction(env, chain, auction_id, cache=None):
@@ -313,7 +323,12 @@ def solve(solver_url, auction_body, timeout):
                                  {"Content-Type": "application/json"})
     t0 = time.monotonic()
     try:
-        raw = urllib.request.urlopen(req, timeout=timeout + 5).read()
+        # Solver endpoints are user-supplied: cap the read so a runaway
+        # endpoint returns a structured error, not memory exhaustion.
+        with urllib.request.urlopen(req, timeout=timeout + 5) as r:
+            raw = r.read(_MAX_HTTP_BYTES + 1)
+        if len(raw) > _MAX_HTTP_BYTES:
+            return None, "response_too_large", int((time.monotonic() - t0) * 1000)
     except urllib.error.HTTPError as e:
         return None, f"http_{e.code}", int((time.monotonic() - t0) * 1000)
     except urllib.error.URLError as e:
@@ -707,6 +722,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                               "attempted": 0, "winner_surplus_attempted": 0,
                               "lost_to_errors": 0,
                               "our_surplus_exact": 0, "winner_surplus_exact": 0,
+                              "rank_rows": [],
                               "invalid": Counter(), "errors": Counter(),
                               "latency": [], "late": 0}
                   for s in args.solvers}
@@ -816,6 +832,21 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 api_check[v] += 1
                 row["api_check"] = v
 
+            comp_rec = None
+            if args.compete or args.archive_dir:
+                api_base = f"{COW_API}/{CHAINS[args.chain]['api']}"
+                comp_rec = competition.fetch_competition(api_base, aid, _http_get, cache)
+                if comp_rec:
+                    # The auction-CUT context (what bidders actually saw) —
+                    # complements settlement_block, which is always later.
+                    row["auction_start_block"] = comp_rec.get("auctionStartBlock")
+                    row["auction_deadline_block"] = comp_rec.get("auctionDeadlineBlock")
+                    if args.archive_dir and competition.archive_store(
+                            args.archive_dir, args.chain, comp_rec):
+                        agg["competition_archived"] += 1
+                else:
+                    agg["competition_missing"] += 1
+
             if args.solvers:
                 expired = sum(1 for o in body.get("orders", [])
                               if int(o.get("validTo", 0)) < now_ts)
@@ -894,6 +925,12 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     vs_row["latency_ms"] = ms
                     if implausible:
                         vs_row["flags"] = ["implausible_surplus"]
+                    if comp_rec is not None and args.compete and ours > 0:
+                        fr = competition.rank_vs_field(comp_rec, ours,
+                                                       args.self_address)
+                        if fr:
+                            vs_row["field_rank"] = fr
+                            st["rank_rows"].append(fr)
                     row["solvers"][sv["name"]] = vs_row
 
             rows.append(row)
@@ -1159,6 +1196,15 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         if cape is not None:
             print(f"  capture (exact-basis): {cape:.1f}%  (direct settlements only — "
                   f"same scoring basis both sides)")
+        ft = competition.field_table(s.get("rank_rows") or [])
+        if ft:
+            print(f"  field rank (proxy)  : rank1 {ft['rank1_pct']}% / top3 "
+                  f"{ft['top3_pct']}% of {ft['auctions_ranked']} ranked auctions, "
+                  f"median rank {ft['median_rank']}, median gap to winner "
+                  f"{ft['median_gap_bps']} bps")
+            for rv in ft["rivals"][:3]:
+                print(f"    rival {rv['solver'][:10]}  wins={rv['wins']}  "
+                      f"median gap {rv['median_gap_bps']} bps")
         if s["latency"]:
             lat = sorted(s["latency"])
             p50 = lat[len(lat) // 2]
@@ -1258,6 +1304,7 @@ def build_summary(st, args, extra, solver_names_map=None):
             "implausible": s["implausible"],
             "p50_ms": lat[len(lat) // 2] if lat else None,
             "p95_ms": lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else None,
+            "field": competition.field_table(s.get("rank_rows") or []),
         })
     cov = {"settlement txs found": len(st["txs"]),
            "auctions formed": st["n_found"], "auctions scored": len(st["rows"])}
@@ -1332,6 +1379,17 @@ def main():
     ap.add_argument("--min-evidence", type=int, default=10,
                     help="minimum attempted auctions before --readiness may say "
                          "READY (below it the best verdict is REVIEW)")
+    ap.add_argument("--compete", action="store_true",
+                    help="fetch each auction's historical competition record "
+                         "(v2 API) and rank the challenger against the "
+                         "fairness-surviving field (rank, gap to winner, rivals)")
+    ap.add_argument("--archive-dir", default=None,
+                    help="persist fetched competition records as "
+                         "DIR/<chain>/<auction_id>.json.gz (implies fetching; "
+                         "builds the local competition dataset)")
+    ap.add_argument("--self-address", default=None,
+                    help="your historical solverAddress — adds shadow-vs-actual "
+                         "comparison when it appears in a competition record")
     ap.add_argument("--verify-api", action="store_true",
                     help="cross-check winner txs against the v2 competition API")
     ap.add_argument("--clamp-validto", action="store_true",

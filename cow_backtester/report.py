@@ -118,6 +118,26 @@ def render(summary, rows, path):
         p.append('<p class="note">Indicative: replayed against <b>live</b> liquidity and scored '
                  'vs the historical winning set. Prices are claimed by the solver, not simulated.</p>')
 
+    # field ranking (--compete)
+    for s in solvers:
+        ft = s.get("field")
+        if not ft:
+            continue
+        p.append(f"<h2>Field ranking — {_esc(s['name'])}</h2>")
+        p.append(f'<p class="sub">rank 1 in {ft["rank1_pct"]}% / top-3 in '
+                 f'{ft["top3_pct"]}% of {ft["auctions_ranked"]} ranked auctions · '
+                 f'median rank {ft["median_rank"]} · median gap to winner '
+                 f'{_esc(ft["median_gap_bps"])} bps</p>')
+        p.append("<div class='scroll'><table><tr><th>rival (winner)</th>"
+                 "<th>wins vs us</th><th>median gap (bps)</th></tr>")
+        for rv in ft.get("rivals", []):
+            p.append(f"<tr><td><code>{_esc(rv['solver'])}</code></td>"
+                     f"<td>{rv['wins']}</td><td>{_esc(rv['median_gap_bps'])}</td></tr>")
+        p.append("</table></div>")
+        p.append('<p class="note">Rank basis: challenger surplus inserted into the '
+                 'fairness-surviving historical score list (scores include protocol '
+                 'fees, surplus does not — the rank is a floor, not flattery).</p>')
+
     # head-to-head
     h2h = summary.get("head_to_head")
     if h2h:

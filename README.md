@@ -80,6 +80,31 @@ on any of the supported chains, so you can readiness-check an endpoint for a
 chain you are not yet onboarded on. It is a signal, not a settlement
 guarantee — pair it with a self-hosted shadow run before going to production.
 
+## Rank against the historical field (`--compete`)
+
+Capture ratio tells you how much surplus you generate; `--compete` tells you
+**where you would have ranked**. For every scored auction it fetches the
+historical competition record (every submitted solution with its score,
+CoW's own fairness-filtering outcome, and the winner) and inserts your
+solver's result into the fairness-surviving score list:
+
+```bash
+cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc> \
+        --solver-url http://localhost:8080 --solver-name mine --compete \
+        --archive-dir ./competition-data
+```
+
+The scorecard gains a field-rank line (rank-1 %, top-3 %, median rank,
+median gap to the winner in bps) and a rivals table — which solvers beat
+you, how often, and by how much. Per-auction `field_rank` lands in the JSON
+rows. Two honesty notes: historical scores include protocol fees while your
+replayed surplus does not, so the reported rank is a **floor** (labeled
+`surplus_vs_score_proxy`); and records exist only for auctions that had a
+winner. `--archive-dir` keeps every fetched record on disk — the API serves
+roughly two months of history, so an archive you build today is a dataset
+you keep. `--self-address` marks your historical solverAddress so rows show
+shadow-vs-actual side by side.
+
 ### Try it without a solver
 
 The bundled mock solver lets you see the full counterfactual/A/B output in
@@ -226,6 +251,10 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--json-out` / `--html-out` | machine-readable rows / HTML report |
 | `--solver-map FILE` | JSON `{address: name}` to label winning submitters |
 | `--verify-api` | cross-check winner txs against the v2 competition API |
+| `--compete` | rank the challenger against the historical fairness-surviving field (rank / gap / rivals) |
+| `--archive-dir DIR` | persist competition records as `DIR/<chain>/<id>.json.gz` (local dataset) |
+| `--self-address 0x…` | your historical solverAddress → shadow-vs-actual comparison |
+| `--min-evidence N` | attempted-auction floor before `--readiness` may say READY (default 10) |
 | `--clamp-validto` | extend expired `validTo` so engines that filter them still solve |
 | `--max-age-hours H` | warn when replayed auctions are older than this |
 | `--watch N` | continuous mode: rescan every N seconds from the last block |

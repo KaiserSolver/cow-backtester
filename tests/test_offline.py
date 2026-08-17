@@ -615,3 +615,104 @@ def test_readiness_empty_solutions_are_healthy_answers():
     assert rep["answer_rate_pct"] == 100.0
     assert rep["verdict"] == "REVIEW"
     assert not any(c["level"] == "fail" for c in rep["checks"])
+
+
+# ------------------------------------------------- v0.8.0 --compete / archive
+
+def _comp_record(**over):
+    base = {
+        "auctionId": 111,
+        "auctionStartBlock": 1000, "auctionDeadlineBlock": 1005,
+        "solutions": [
+            {"solverAddress": "0xAAA1", "score": "1000", "ranking": 1,
+             "isWinner": True, "filteredOut": False, "orders": []},
+            {"solverAddress": "0xBBB2", "score": "900", "ranking": 2,
+             "isWinner": False, "filteredOut": False, "orders": []},
+            {"solverAddress": "0xCCC3", "score": "5000", "ranking": 0,
+             "isWinner": False, "filteredOut": True, "orders": []},
+            {"solverAddress": "0xDDD4", "score": "800", "ranking": 3,
+             "isWinner": False, "filteredOut": False, "orders": []},
+        ],
+    }
+    base.update(over)
+    return base
+
+
+def test_rank_vs_field_excludes_filtered_and_ranks_floor():
+    from cow_backtester import competition
+    rec = _comp_record()
+    # 950 sits between 1000 and 900 among fairness-SURVIVING bids; the 5000
+    # filteredOut bid must not count (CoW itself excluded it).
+    fr = competition.rank_vs_field(rec, 950)
+    assert fr["rank"] == 2 and fr["field_size"] == 3
+    assert fr["winner_solver"] == "0xaaa1"
+    assert fr["filtered_out_bids"] == 1
+    assert fr["rank_basis"] == "surplus_vs_score_proxy"
+    assert fr["gap_to_winner_bps"] == 500.0  # (1000-950)/1000
+    # tie ranks BELOW the historical bid (conservative)
+    assert competition.rank_vs_field(rec, 1000)["rank"] == 2
+    assert competition.rank_vs_field(rec, 1001)["beats_winner"] is True
+    assert competition.rank_vs_field(rec, 1001)["rank"] == 1
+
+
+def test_rank_vs_field_self_address_shadow_vs_actual():
+    from cow_backtester import competition
+    fr = competition.rank_vs_field(_comp_record(), 950, self_address="0xbbb2")
+    hs = fr["historical_self"]
+    assert hs["score_wei"] == 900 and hs["ranking"] == 2
+    assert hs["is_winner"] is False and hs["filtered_out"] is False
+
+
+def test_rank_vs_field_empty_field():
+    from cow_backtester import competition
+    assert competition.rank_vs_field({"solutions": []}, 100) is None
+    only_filtered = {"solutions": [{"solverAddress": "0xE", "score": "10",
+                                    "filteredOut": True}]}
+    assert competition.rank_vs_field(only_filtered, 100) is None
+
+
+def test_field_table_aggregates_and_rivals():
+    from cow_backtester import competition
+    rows = [
+        {"rank": 1, "gap_to_winner_bps": -5.0, "winner_solver": "0xa"},
+        {"rank": 2, "gap_to_winner_bps": 3.0, "winner_solver": "0xa"},
+        {"rank": 3, "gap_to_winner_bps": 9.0, "winner_solver": "0xb"},
+        None,
+    ]
+    ft = competition.field_table(rows)
+    assert ft["auctions_ranked"] == 3
+    assert ft["rank1_pct"] == pytest.approx(33.3, abs=0.1)
+    assert ft["top3_pct"] == 100.0
+    assert ft["rivals"][0]["solver"] == "0xa" and ft["rivals"][0]["wins"] == 2
+    assert competition.field_table([None, None]) is None
+
+
+def test_archive_store_idempotent(tmp_path):
+    from cow_backtester import competition
+    rec = _comp_record()
+    assert competition.archive_store(str(tmp_path), "base", rec) is True
+    assert competition.archive_store(str(tmp_path), "base", rec) is False
+    import gzip as _gz, json as _json
+    p = competition.archive_path(str(tmp_path), "base", 111)
+    with _gz.open(p, "rt") as f:
+        assert _json.load(f)["auctionId"] == 111
+    assert competition.archive_store(str(tmp_path), "base", {"noid": 1}) is False
+
+
+def test_fetch_competition_offline_paths():
+    from cow_backtester import competition
+    calls = []
+
+    def fake_get(url, timeout=15):
+        calls.append(url)
+        return json.dumps(_comp_record()).encode()
+
+    rec = competition.fetch_competition("https://api/x", 111, fake_get)
+    assert rec["auctionId"] == 111 and calls[0].endswith("/api/v2/solver_competition/111")
+
+    def failing_get(url, timeout=15):
+        raise OSError("down")
+    assert competition.fetch_competition("https://api/x", 112, failing_get) is None
+    # malformed payload -> None, never raises
+    assert competition.fetch_competition(
+        "https://api/x", 113, lambda u, timeout=15: b'{"weird": true}') is None

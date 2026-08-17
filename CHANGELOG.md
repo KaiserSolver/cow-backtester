@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.8.0 — 2026-08-17
+
+**`--compete`: rank your solver against the historical field.** The v2
+competition endpoint serves per-auction records by auction id (probed:
+retention ≥ 2 months) carrying every submitted solution — solver, score,
+ranking, CoW's own fairness-filtering outcome (`filteredOut`), per-solution
+clearing prices, reference scores, and the auction's start/deadline blocks.
+
+- `--compete` fetches each scored auction's record and inserts the
+  challenger's surplus into the fairness-surviving score list: per-auction
+  `field_rank` (rank, field size, gap-to-winner bps, winner solver), and a
+  per-solver summary — rank-1 %, top-3 %, median rank/gap, and a rivals
+  table (who beat you, how often, by how much). Honesty label everywhere:
+  `rank_basis: surplus_vs_score_proxy` — historical scores include protocol
+  fees, challenger surplus does not, so the rank is a floor.
+- `--archive-dir DIR` persists every fetched record as
+  `DIR/<chain>/<auction_id>.json.gz` (idempotent) — a local competition
+  dataset that outlives the API's retention window and feeds future
+  fairness-simulation / reward-EV work.
+- `--self-address 0x…` adds shadow-vs-actual: when your historical
+  solverAddress appears in a record, the row carries its actual score,
+  ranking, and fairness outcome next to the replayed one.
+- Rows gain `auction_start_block` / `auction_deadline_block` — the auction
+  CUT context (what bidders saw), complementing `settlement_block`.
+
 ## 0.7.2 — 2026-08-17
 
 Scoring-fidelity batch from an independent line-level audit. Every item
