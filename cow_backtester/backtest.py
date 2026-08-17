@@ -139,22 +139,31 @@ CAVEATS = [
 
 # ---------------------------------------------------------------- primitives
 
+MAX_U256 = (1 << 256) - 1
+
+
 def to_u256(v):
     """Parse a DTO U256: non-negative int, decimal string, or 0x-hex string.
-    Rejects negatives, bools and exotic Python int syntax the DTO would refuse."""
+    Rejects negatives, bools, exotic Python int syntax the DTO would refuse,
+    and anything above 2^256-1 — Python ints are unbounded, so without the
+    upper check a buggy solver response could smuggle un-representable
+    amounts straight into the score (v0.7.2 audit P0)."""
     if isinstance(v, bool):
         raise ValueError(f"not a U256: {v!r}")
+    n = None
     if isinstance(v, int):
-        if v < 0:
-            raise ValueError(f"negative U256: {v!r}")
-        return v
-    if isinstance(v, str):
+        n = v
+    elif isinstance(v, str):
         s = v.strip()
         if _HEX.match(s):
-            return int(s, 16)
-        if _DEC.match(s):
-            return int(s)
-    raise ValueError(f"not a U256: {v!r}")
+            n = int(s, 16)
+        elif _DEC.match(s):
+            n = int(s)
+    if n is None:
+        raise ValueError(f"not a U256: {v!r}")
+    if n < 0 or n > MAX_U256:
+        raise ValueError(f"out of U256 range: {v!r}")
+    return n
 
 
 def _http_get(url, timeout=20):
@@ -482,20 +491,66 @@ def validate_and_score(resp, body, ref_prices):
             invalid["malformed"] += 1
             continue
 
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    taken, combined, by_pair = set(), 0, defaultdict(int)
-    for s, prs, pw in candidates:
-        if prs & taken:
-            continue
-        combined += s
-        taken |= prs
+    combined, chosen, combiner = _best_disjoint_combination(candidates)
+    by_pair = defaultdict(int)
+    for _, _, pw in chosen:
         for k, v in pw.items():
             by_pair[k] += v
-    out["best_single_wei"] = candidates[0][0] if candidates else 0
+    out["best_single_wei"] = max((c[0] for c in candidates), default=0)
     out["best_surplus_wei"] = combined
+    out["combiner"] = combiner
     out["by_pair"] = {f"{a}|{b}": v for (a, b), v in by_pair.items()}
     out["invalid"] = dict(invalid)
     return out
+
+
+# Above this size, exact search could blow up (2^n subsets) and we fall back
+# to greedy; real /solve responses carry a handful of solutions, so the
+# fallback should never fire outside adversarial inputs. The result is
+# labeled either way (`combiner: exact|greedy`).
+_EXACT_COMBINER_MAX = 20
+
+
+def _best_disjoint_combination(candidates):
+    """Maximum-weight selection of solutions with pairwise-disjoint directed
+    pairs (the solver's best internally compatible combination — NOT a CIP-67
+    competition simulation, which would need the historical field + fairness
+    filtering). Greedy highest-first is NOT optimal here: solutions A=10 on
+    {P1,P2} vs B=6 on {P1} + C=6 on {P2} — greedy takes 10, optimum is 12.
+    Exact branch-and-bound over ≤ _EXACT_COMBINER_MAX candidates; sorted
+    descending so the remaining-sum bound prunes hard.
+    Returns (total_wei, chosen_candidates, combiner_label)."""
+    if not candidates:
+        return 0, [], "exact"
+    cands = sorted(candidates, key=lambda c: c[0], reverse=True)
+    if len(cands) > _EXACT_COMBINER_MAX:
+        taken, combined, chosen = set(), 0, []
+        for c in cands:
+            if c[1] & taken:
+                continue
+            combined += c[0]
+            taken |= c[1]
+            chosen.append(c)
+        return combined, chosen, "greedy"
+    suffix = [0] * (len(cands) + 1)
+    for i in range(len(cands) - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + cands[i][0]
+    best = {"total": 0, "chosen": []}
+
+    def dfs(i, taken, total, chosen):
+        if total > best["total"]:
+            best["total"], best["chosen"] = total, list(chosen)
+        if i == len(cands) or total + suffix[i] <= best["total"]:
+            return
+        score, pairs, _ = cands[i]
+        if not (pairs & taken):
+            chosen.append(cands[i])
+            dfs(i + 1, taken | pairs, total + score, chosen)
+            chosen.pop()
+        dfs(i + 1, taken, total, chosen)
+
+    dfs(0, frozenset(), 0, [])
+    return best["total"], best["chosen"], "exact"
 
 
 def resolve_auction_by_tx(chain, tx, cache):
@@ -643,6 +698,15 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
     per_solver = {s["name"]: {"replayed": 0, "errored": 0, "returned": 0, "valid": 0,
                               "positive": 0, "beat": 0, "our_surplus": 0,
                               "winner_surplus": 0, "implausible": 0,
+                              # v0.7.2 coverage-adjusted accounting: attempted
+                              # counts EVERY auction sent to the solver, and
+                              # winner_surplus_attempted accrues the baseline
+                              # on errors too — otherwise a solver improves
+                              # its capture ratio by failing hard auctions
+                              # (survivorship bias, audit P0).
+                              "attempted": 0, "winner_surplus_attempted": 0,
+                              "lost_to_errors": 0,
+                              "our_surplus_exact": 0, "winner_surplus_exact": 0,
                               "invalid": Counter(), "errors": Counter(),
                               "latency": [], "late": 0}
                   for s in args.solvers}
@@ -662,15 +726,35 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
             jit_owners = {a.lower() for a in body.get("surplusCapturingJitOrderOwners", []) or []}
 
             by_uid = {o["uid"].lower() for o in body.get("orders", [])}
-            any_overlap = any(ev["uid"] in by_uid for r in txrecs for ev in r["events"])
-            all_jit = bool(jit_owners) and all(
-                ev["owner"] in jit_owners for r in txrecs for ev in r["events"])
-            if not any_overlap and not all_jit:
+            # PER-TRANSACTION attribution proof (v0.7.2): each settlement tx
+            # must individually show UID overlap with the auction body (or be
+            # all-JIT). The old group-level any() let one correctly attributed
+            # tx vouch for every other tx in the auction group — a
+            # misattributed wrapper tx would then pollute the winner baseline.
+            kept = []
+            for r in txrecs:
+                tx_overlap = any(ev["uid"] in by_uid for ev in r["events"])
+                tx_all_jit = bool(jit_owners) and all(
+                    ev["owner"] in jit_owners for ev in r["events"])
+                if tx_overlap or tx_all_jit:
+                    kept.append(r)
+                else:
+                    skip["tx_uid_mismatch"] += 1
+            if not kept:
                 skip["body_uid_mismatch"] += 1
                 continue
+            txrecs = kept
 
             winner_total = winner_fees = 0
             winner_txs, per_trades = [], []
+            # Baseline quality label (v0.7.2): direct settlements score on the
+            # exact uniform-price basis; wrapper settlements on the delivered
+            # (lower-bound) basis. Aggregating the two silently mixes bases,
+            # so every row and every capture metric carries the label.
+            n_wrap = sum(1 for r in txrecs if r.get("dec") is None)
+            baseline_quality = ("exact_uniform" if n_wrap == 0
+                                else "wrapper_lower_bound" if n_wrap == len(txrecs)
+                                else "mixed")
             for r in txrecs:
                 if r.get("dec") is None:
                     # wrapper-routed: events-only scoring (delivered basis)
@@ -711,6 +795,10 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     ps["label"] = f"{token_symbol(body, pt['sell'])}->{token_symbol(body, pt['buy'])}"
             total_fees += winner_fees
 
+            # Highest SETTLEMENT block of the auction's txs — NOT the auction
+            # cut block (state at bid time is earlier). Exposed as
+            # `settlement_block`; `block` kept one release as a deprecated
+            # alias (v0.7.2).
             blk = max(r["block"] for r in txrecs)
             ts = block_ts(rpcs, blk, ts_mem, cache, max_cacheable)
             age_h = (now_ts - ts) / 3600 if ts is not None else None
@@ -718,10 +806,10 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 ages.append(age_h)
 
             row = {"v": VERSION, "chain": args.chain, "env": args.env, "auction_id": aid,
-                   "block": blk, "block_ts": ts,
+                   "settlement_block": blk, "block": blk, "block_ts": ts,
                    "age_hours": round(age_h, 2) if age_h is not None else None,
                    "winner_txs": winner_txs, "winner_surplus_wei": winner_total,
-                   "winner_fee_wei": winner_fees}
+                   "winner_fee_wei": winner_fees, "baseline_quality": baseline_quality}
 
             if args.verify_api:
                 v = verify_against_api(args.chain, aid, [t["tx"] for t in winner_txs])
@@ -741,21 +829,29 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     row["validto_clamped"] = expired
 
                 row["solvers"] = {}
+                # ONE shared deadline per auction (v0.7.2): computed before
+                # the solver loop so every endpoint receives byte-identical
+                # bodies — the per-request deadline regeneration broke the
+                # "A/B on identical inputs" guarantee.
+                body["deadline"] = (datetime.now(timezone.utc)
+                                    + timedelta(seconds=args.solve_timeout)
+                                    ).isoformat().replace("+00:00", "Z")
+                row["replay_deadline"] = body["deadline"]
                 # rotate which solver goes first so neither gets a systematic
                 # first-mover advantage from chain state drifting between calls
                 order = args.solvers[idx % len(args.solvers):] + args.solvers[:idx % len(args.solvers)]
                 for sv in order:
-                    body["deadline"] = (datetime.now(timezone.utc)
-                                        + timedelta(seconds=args.solve_timeout)
-                                        ).isoformat().replace("+00:00", "Z")
                     resp, err, ms = solve(sv["url"], body, args.solve_timeout)
                     st = per_solver[sv["name"]]
+                    st["attempted"] += 1
+                    st["winner_surplus_attempted"] += winner_total
                     st["latency"].append(ms)
                     if ms > args.solve_timeout * 1000:
                         st["late"] += 1
                     if err:
                         st["errored"] += 1
                         st["errors"][err] += 1
+                        st["lost_to_errors"] += winner_total
                         row["solvers"][sv["name"]] = {"solve_error": err, "latency_ms": ms}
                         continue
                     try:
@@ -763,6 +859,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     except Exception as e:
                         st["errored"] += 1
                         st["errors"]["bad_solver_response"] += 1
+                        st["lost_to_errors"] += winner_total
                         row["solvers"][sv["name"]] = {
                             "solve_error": f"bad_solver_response ({type(e).__name__})",
                             "latency_ms": ms}
@@ -771,6 +868,9 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     st["winner_surplus"] += winner_total
                     ours = vs["best_surplus_wei"]
                     st["our_surplus"] += ours
+                    if baseline_quality == "exact_uniform":
+                        st["winner_surplus_exact"] += winner_total
+                        st["our_surplus_exact"] += ours
                     if vs["n_solutions"]:
                         st["returned"] += 1
                     if vs["n_valid"]:
@@ -828,14 +928,24 @@ def readiness_report(st, args):
     reports = []
     for sv in args.solvers:
         s = st["per_solver"][sv["name"]]
-        attempted = s["replayed"] + s["errored"]
+        attempted = s.get("attempted") or (s["replayed"] + s["errored"])
         lat = sorted(s["latency"])
         p50 = lat[len(lat) // 2] if lat else None
         p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else None
         pmax = lat[-1] if lat else None
-        answer_rate = _pct(s["returned"], attempted)
-        valid_rate = _pct(s["valid"], s["replayed"])
-        capture = _pct(s["our_surplus"], s["winner_surplus"])
+        # v0.7.2 semantics split: an HTTP-200 `{"solutions": []}` is a HEALTHY
+        # answer (the schema's legitimate abstention), not an endpoint
+        # failure — so answer rate counts parsed responses (replayed), and
+        # bid coverage separately counts auctions with >=1 solution.
+        answer_rate = _pct(s["replayed"], attempted)
+        bid_rate = _pct(s["returned"], s["replayed"])
+        valid_rate = _pct(s["valid"], s["returned"])
+        # Coverage-adjusted capture is the honest readiness read: errors keep
+        # the historical winner in the denominator (survivorship-bias fix).
+        capture_adj = _pct(s["our_surplus"],
+                           s.get("winner_surplus_attempted") or s["winner_surplus"])
+        capture_cond = _pct(s["our_surplus"], s["winner_surplus"])
+        capture = capture_adj
         # A conservative pass/warn read for a first-time integrator.
         checks = []
 
@@ -848,7 +958,14 @@ def readiness_report(st, args):
             chk(s["errored"] == 0, s["errored"] < attempted, "no transport errors",
                 f"{s['errored']}/{attempted} errored" if s["errored"] else "0 errors")
             chk((answer_rate or 0) >= 90, (answer_rate or 0) >= 50, "answers reliably",
-                f"{answer_rate:.0f}% returned a solution" if answer_rate is not None else "n/a")
+                f"{answer_rate:.0f}% returned a parseable response (incl. legitimate "
+                f"empty solutions)" if answer_rate is not None else "n/a")
+            if s["replayed"]:
+                # Low bid coverage is a strategy fact, not an endpoint fault —
+                # warn at most, never fail.
+                chk((bid_rate or 0) >= 50, True, "bid coverage",
+                    f"{bid_rate:.0f}% of answered auctions carried >=1 solution"
+                    if bid_rate is not None else "n/a")
             chk(s["late"] == 0, s["late"] * 5 <= attempted, "inside the deadline",
                 f"{s['late']} past the advertised deadline"
                 if s["late"] else "0 past deadline")
@@ -856,11 +973,20 @@ def readiness_report(st, args):
                 budget = args.solve_timeout * 1000
                 chk(p95 <= budget * 0.5, p95 <= budget, "latency headroom",
                     f"p95 {p95} ms of a {budget} ms budget")
-            if s["replayed"]:
+            if s["returned"]:
                 chk((valid_rate or 0) >= 90, (valid_rate or 0) >= 50, "solutions are valid",
-                    f"{valid_rate:.0f}% passed limit/fee checks" if valid_rate is not None else "n/a")
+                    f"{valid_rate:.0f}% of bid auctions had >=1 valid solution"
+                    if valid_rate is not None else "n/a")
                 chk((capture or 0) >= 50, (capture or 0) > 0, "competitive vs winners",
-                    f"{capture:.0f}% of winner surplus captured" if capture is not None else "n/a")
+                    f"{capture:.0f}% of winner surplus captured (coverage-adjusted; "
+                    f"{capture_cond:.0f}% conditional on answering)"
+                    if capture is not None and capture_cond is not None else "n/a")
+            elif s["replayed"]:
+                # Healthy endpoint that never bid: nothing to assess — that is
+                # a strategy fact, not an endpoint failure, but it also cannot
+                # evidence readiness.
+                chk(False, True, "competitive vs winners",
+                    "no bids returned on any answered auction — nothing to assess")
             if s["implausible"]:
                 chk(False, True, "prices look plausible",
                     f"{s['implausible']} auction(s) flagged implausible_surplus")
@@ -879,11 +1005,22 @@ def readiness_report(st, args):
         verdict = ("READY" if all(c["level"] == "ok" for c in checks)
                    else "NOT READY" if any(c["level"] == "fail" for c in checks)
                    else "REVIEW")
+        # Evidence floor (v0.7.2): READY is a strong claim — one lucky auction
+        # must not produce it. Below the floor the best verdict is REVIEW.
+        min_evidence = getattr(args, "min_evidence", 10)
+        if verdict == "READY" and attempted < min_evidence:
+            verdict = "REVIEW"
+            chk(False, True, "sufficient evidence",
+                f"only {attempted} auction(s) attempted; READY needs >= "
+                f"{min_evidence} (--min-evidence)")
         rep = {
             "solver": sv["name"], "url": sv["url"], "verdict": verdict,
-            "auctions_attempted": attempted, "answered": s["returned"],
-            "answer_rate_pct": answer_rate, "errored": s["errored"],
+            "auctions_attempted": attempted, "answered": s["replayed"],
+            "bids": s["returned"],
+            "answer_rate_pct": answer_rate, "bid_rate_pct": bid_rate,
+            "errored": s["errored"],
             "valid_rate_pct": valid_rate, "capture_pct": capture,
+            "capture_conditional_pct": capture_cond,
             "p50_ms": p50, "p95_ms": p95, "max_ms": pmax,
             "past_deadline": s["late"], "solve_timeout_s": args.solve_timeout,
             "implausible": s["implausible"], "checks": checks,
@@ -901,8 +1038,9 @@ def readiness_report(st, args):
         for c in checks:
             print(f"  [{mark[c['level']]}] {c['label']:<24} {c['detail']}")
         print("  " + "-" * 64)
-        print(f"  answered            : {s['returned']}/{attempted}"
-              + (f"  ({answer_rate:.0f}%)" if answer_rate is not None else ""))
+        print(f"  answered            : {s['replayed']}/{attempted}"
+              + (f"  ({answer_rate:.0f}%)" if answer_rate is not None else "")
+              + f"   bids: {s['returned']}")
         if p50 is not None:
             print(f"  latency             : p50 {p50} ms / p95 {p95} ms / max {pmax} ms"
                   f"   (budget {args.solve_timeout * 1000} ms)")
@@ -1003,10 +1141,24 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         print(f"  positive surplus    : {s['positive']}/{s['replayed']}")
         print(f"  beat the winning set: {s['beat']}/{s['replayed']}")
         print(f"  our surplus (sum)   : {s['our_surplus'] / 1e18:.6f} {nat}")
-        print(f"  winners (sum)       : {s['winner_surplus'] / 1e18:.6f} {nat}  (replayed auctions only)")
-        cap = _pct(s["our_surplus"], s["winner_surplus"])
-        if cap is not None:
-            print(f"  capture ratio       : {cap:.1f}% of the winning set")
+        wsa = s.get("winner_surplus_attempted") or s["winner_surplus"]
+        print(f"  winners (attempted) : {wsa / 1e18:.6f} {nat}  (all auctions sent, "
+              f"errors count as zero for us)")
+        cap_adj = _pct(s["our_surplus"], wsa)
+        cap_cond = _pct(s["our_surplus"], s["winner_surplus"])
+        if cap_adj is not None:
+            print(f"  capture (adjusted)  : {cap_adj:.1f}% of the winning set "
+                  f"(headline; survivorship-safe)")
+        if cap_cond is not None and cap_cond != cap_adj:
+            print(f"  capture (answered)  : {cap_cond:.1f}%  (only auctions we "
+                  f"responded to — diagnostic)")
+        if s.get("lost_to_errors"):
+            print(f"  lost to errors      : {s['lost_to_errors'] / 1e18:.6f} {nat} "
+                  f"of winner surplus on auctions where we errored/timed out")
+        cape = _pct(s.get("our_surplus_exact", 0), s.get("winner_surplus_exact", 0))
+        if cape is not None:
+            print(f"  capture (exact-basis): {cape:.1f}%  (direct settlements only — "
+                  f"same scoring basis both sides)")
         if s["latency"]:
             lat = sorted(s["latency"])
             p50 = lat[len(lat) // 2]
@@ -1090,11 +1242,19 @@ def build_summary(st, args, extra, solver_names_map=None):
     for sv in args.solvers:
         s = st["per_solver"][sv["name"]]
         lat = sorted(s["latency"])
+        wsa = s.get("winner_surplus_attempted") or s["winner_surplus"]
         solvers.append({
             "name": sv["name"], "replayed": s["replayed"], "errored": s["errored"],
             "returned": s["returned"], "valid": s["valid"], "positive": s["positive"],
             "beat": s["beat"], "our_surplus": s["our_surplus"],
-            "capture_pct": _pct(s["our_surplus"], s["winner_surplus"]),
+            # Headline = coverage-adjusted (errors keep the winner in the
+            # denominator); conditional kept as a labeled diagnostic.
+            "capture_pct": _pct(s["our_surplus"], wsa),
+            "capture_conditional_pct": _pct(s["our_surplus"], s["winner_surplus"]),
+            "capture_exact_basis_pct": _pct(s.get("our_surplus_exact", 0),
+                                            s.get("winner_surplus_exact", 0)),
+            "winner_surplus_attempted": wsa,
+            "lost_to_errors_wei": s.get("lost_to_errors", 0),
             "implausible": s["implausible"],
             "p50_ms": lat[len(lat) // 2] if lat else None,
             "p95_ms": lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else None,
@@ -1150,7 +1310,7 @@ def main():
     ap.add_argument("--from-block", type=int, default=None, help="absolute scan start (reproducible)")
     ap.add_argument("--to-block", type=int, default=None, help="absolute scan end; omit to use the chain head")
     ap.add_argument("--max-auctions", type=int, default=25,
-                    help="cap auctions scored, oldest first (0 = all)")
+                    help="cap auctions scored, newest first (0 = all)")
     ap.add_argument("--rpc-url", default=None, help="chain RPC (recommended)")
     ap.add_argument("--solver-url", action="append", default=[],
                     help="solver /solve endpoint; repeat for A/B")
@@ -1169,6 +1329,9 @@ def main():
                     help="print a one-screen pre-prod readiness check for the "
                          "solver endpoint(s) instead of the full field scorecard "
                          "(answer rate, latency, validity, surplus vs winners)")
+    ap.add_argument("--min-evidence", type=int, default=10,
+                    help="minimum attempted auctions before --readiness may say "
+                         "READY (below it the best verdict is REVIEW)")
     ap.add_argument("--verify-api", action="store_true",
                     help="cross-check winner txs against the v2 competition API")
     ap.add_argument("--clamp-validto", action="store_true",

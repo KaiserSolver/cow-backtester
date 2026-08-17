@@ -54,13 +54,31 @@ def render(summary, rows, path):
     # headline cards
     p.append('<div class="grid">')
     p.append(f'<div class="card"><div class="k">Auctions scored</div><div class="v">{len(rows)}</div></div>')
-    p.append(f'<div class="card"><div class="k">Winner surplus</div><div class="v">{_eth(summary.get("field_surplus_wei", 0), nat)}</div></div>')
-    p.append(f'<div class="card"><div class="k">Winner fee take</div><div class="v">{_eth(summary.get("field_fees_wei", 0), nat)}</div></div>')
+    p.append(f'<div class="card"><div class="k">Winner surplus (mixed-basis proxy)</div><div class="v">{_eth(summary.get("field_surplus_wei", 0), nat)}</div></div>')
+    p.append(f'<div class="card"><div class="k">Known direct-path fee wedge</div><div class="v">{_eth(summary.get("field_fees_wei", 0), nat)}</div></div>')
     for s in solvers:
         cap = s.get("capture_pct")
-        p.append(f'<div class="card"><div class="k">{_esc(s["name"])} capture</div>'
+        p.append(f'<div class="card"><div class="k">{_esc(s["name"])} capture (coverage-adj.)</div>'
                  f'<div class="v">{"n/a" if cap is None else f"{cap:.1f}%"}</div></div>')
     p.append("</div>")
+    p.append('<p class="note">Winner surplus mixes exact uniform-price scoring (direct '
+             'settlements) with delivered-basis lower bounds (wrapper settlements); '
+             'fee take covers direct settlements only — wrapper fees are unknown, '
+             'not zero. Per-row <code>baseline_quality</code> labels the basis.</p>')
+
+    # readiness (when --readiness ran)
+    for rep in summary.get("readiness") or []:
+        v = rep.get("verdict", "?")
+        cls = {"READY": "good", "REVIEW": "warn"}.get(v, "bad")
+        p.append(f'<h2>Readiness — {_esc(rep.get("solver"))} '
+                 f'<span class="{cls}">[{_esc(v)}]</span></h2>')
+        p.append("<div class='scroll'><table><tr><th>check</th><th>level</th><th>detail</th></tr>")
+        for c in rep.get("checks", []):
+            ccls = {"ok": "good", "warn": "warn"}.get(c.get("level"), "bad")
+            p.append(f"<tr><td>{_esc(c.get('label'))}</td>"
+                     f"<td class='{ccls}'>{_esc(c.get('level'))}</td>"
+                     f"<td>{_esc(c.get('detail'))}</td></tr>")
+        p.append("</table></div>")
 
     # coverage
     cov = summary.get("coverage", {})

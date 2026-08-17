@@ -536,3 +536,82 @@ def test_max_auctions_keeps_newest():
     auctions = {100: [], 200: [], 300: []}
     aids = sorted(auctions)[-2:]
     assert aids == [200, 300]
+
+
+# ----------------------------------------------- v0.7.2 audit regression tests
+
+def test_combiner_exact_beats_greedy():
+    """Audit P0: greedy highest-first picks A=10 spanning {P1,P2}; the optimum
+    is B+C = 6+6 = 12 on the two pairs separately."""
+    a = (10, frozenset({("p1s", "p1b"), ("p2s", "p2b")}),
+         {("p1s", "p1b"): 5, ("p2s", "p2b"): 5})
+    b = (6, frozenset({("p1s", "p1b")}), {("p1s", "p1b"): 6})
+    c = (6, frozenset({("p2s", "p2b")}), {("p2s", "p2b"): 6})
+    total, chosen, label = backtest._best_disjoint_combination([a, b, c])
+    assert total == 12 and label == "exact"
+    assert {id(x) for x in chosen} == {id(b), id(c)}
+
+
+def test_combiner_greedy_fallback_labeled():
+    cands = [(i + 1, frozenset({(f"s{i}", f"b{i}")}), {(f"s{i}", f"b{i}"): i + 1})
+             for i in range(backtest._EXACT_COMBINER_MAX + 1)]
+    total, chosen, label = backtest._best_disjoint_combination(cands)
+    # all pairs disjoint: greedy == exact here, but the label must disclose it
+    assert label == "greedy"
+    assert total == sum(c[0] for c in cands)
+
+
+def test_combiner_empty_and_single():
+    assert backtest._best_disjoint_combination([]) == (0, [], "exact")
+    one = (7, frozenset({("a", "b")}), {("a", "b"): 7})
+    total, chosen, label = backtest._best_disjoint_combination([one])
+    assert total == 7 and chosen == [one] and label == "exact"
+
+
+def test_to_u256_enforces_upper_bound():
+    """Audit P0: Python ints are unbounded — 2^256-1 passes, anything above
+    must be rejected, in int, decimal-string, and hex form."""
+    assert backtest.to_u256(backtest.MAX_U256) == backtest.MAX_U256
+    assert backtest.to_u256(str(backtest.MAX_U256)) == backtest.MAX_U256
+    for bad in (backtest.MAX_U256 + 1, str(backtest.MAX_U256 + 1),
+                hex(backtest.MAX_U256 + 1), 2**300):
+        with pytest.raises(ValueError):
+            backtest.to_u256(bad)
+
+
+def test_readiness_capture_is_coverage_adjusted():
+    """Audit P0 (survivorship bias): an errored 100 ETH auction must stay in
+    the capture denominator; conditional capture stays as the diagnostic."""
+    C = __import__("collections").Counter
+    s = _solver_stat(replayed=10, errored=10, attempted=20,
+                     returned=10, valid=10, positive=10,
+                     our_surplus=10**18, winner_surplus=10**18,
+                     winner_surplus_attempted=101 * 10**18,
+                     lost_to_errors=100 * 10**18,
+                     latency=[100] * 20, errors=C({"timeout": 10}))
+    args = _Args([{"name": "mine", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"mine": s}), args)[0]
+    assert rep["capture_pct"] == pytest.approx(100 / 101, abs=0.01)
+    assert rep["capture_conditional_pct"] == 100.0
+
+
+def test_readiness_one_auction_cannot_be_ready():
+    """Audit P1: a single perfect auction must not produce READY."""
+    s = _solver_stat(replayed=1, returned=1, valid=1, positive=1,
+                     our_surplus=10**18, winner_surplus=10**18, latency=[100])
+    args = _Args([{"name": "mine", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"mine": s}), args)[0]
+    assert rep["verdict"] == "REVIEW"
+    assert any(c["label"] == "sufficient evidence" for c in rep["checks"])
+
+
+def test_readiness_empty_solutions_are_healthy_answers():
+    """Audit P1: {"solutions": []} is the schema's legitimate abstention.
+    An always-abstaining endpoint answers 100% and lands REVIEW (nothing to
+    assess), never NOT READY on 'reliability'."""
+    s = _solver_stat(replayed=20, returned=0, valid=0, latency=[100] * 20)
+    args = _Args([{"name": "shy", "url": "http://x"}])
+    rep = backtest.readiness_report(_st({"shy": s}), args)[0]
+    assert rep["answer_rate_pct"] == 100.0
+    assert rep["verdict"] == "REVIEW"
+    assert not any(c["level"] == "fail" for c in rep["checks"])

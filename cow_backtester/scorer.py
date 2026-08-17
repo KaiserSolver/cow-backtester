@@ -303,10 +303,15 @@ def wrapper_settlement_surplus(events, body, ref_prices):
 
 
 def to_u256_str(v):
-    """Body amounts arrive as decimal strings; tolerate ints. None -> 0."""
+    """Body amounts arrive as decimal strings; tolerate ints. None -> 0.
+    Range-checked: auction bodies are trusted-ish, but an out-of-U256 value
+    is corrupt data either way and must not reach the arithmetic."""
     if v is None:
         return 0
-    return int(v) if not isinstance(v, str) else int(v, 16) if v.startswith("0x") else int(v)
+    n = int(v) if not isinstance(v, str) else int(v, 16) if v.startswith("0x") else int(v)
+    if n < 0 or n > (1 << 256) - 1:
+        raise ValueError(f"out of U256 range: {v!r}")
+    return n
 
 
 def winner_settlement_surplus(decoded, events, body, ref_prices):

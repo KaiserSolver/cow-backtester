@@ -217,7 +217,7 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--env` | `prod` (default) or `staging` |
 | `--blocks N` | scan the most recent N blocks |
 | `--from-block/--to-block` | absolute, reproducible window |
-| `--max-auctions N` | cap auctions scored, oldest first (default 25; 0 = all) |
+| `--max-auctions N` | cap auctions scored, newest first (default 25; 0 = all) |
 | `--rpc-url` | your RPC (recommended — public defaults rot and rate-limit) |
 | `--solver-url` / `--solver-name` | repeatable; two of them = A/B |
 | `--solve-timeout S` | deadline advertised to the solver (HTTP waits S+5) |
@@ -251,9 +251,12 @@ two-solver run) without changing a single number. Delete `.cowbt-cache` any time
   state, not the historical block. The counterfactual is **indicative** — it
   answers "how does my solver handle this real order flow", not "the exact
   outcome at that block". Ages are printed and a warning fires beyond
-  `--max-age-hours` (default 6h). Prefer recent, short windows. For strict
-  historical fidelity, point your solver at a fork pinned to the auction's
-  block (each row carries `block`), and treat this tool as the scorer.
+  `--max-age-hours` (default 6h). Prefer recent, short windows. Each row
+  carries `settlement_block` — the block the winning settlement landed in,
+  which is *later* than the auction cut block the bidders actually saw. A
+  fork pinned there is an approximation, not a faithful auction replay (it
+  can even include the settlement itself); true historical-fork replay needs
+  the auction cut block, which this tool does not yet reconstruct.
 * **The S3 bucket retains roughly one month** of auctions (measured Aug 2026).
   This is a recent-window backtester, not an archive.
 * **Entrypoint coverage.** Direct `settle()` calls are attributed by the
