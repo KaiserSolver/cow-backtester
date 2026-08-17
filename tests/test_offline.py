@@ -692,10 +692,10 @@ def test_archive_store_idempotent(tmp_path):
     rec = _comp_record()
     assert competition.archive_store(str(tmp_path), "base", rec) is True
     assert competition.archive_store(str(tmp_path), "base", rec) is False
-    import gzip as _gz, json as _json
+    import gzip as _gz
     p = competition.archive_path(str(tmp_path), "base", 111)
     with _gz.open(p, "rt") as f:
-        assert _json.load(f)["auctionId"] == 111
+        assert json.load(f)["auctionId"] == 111
     assert competition.archive_store(str(tmp_path), "base", {"noid": 1}) is False
 
 
