@@ -716,3 +716,87 @@ def test_fetch_competition_offline_paths():
     # malformed payload -> None, never raises
     assert competition.fetch_competition(
         "https://api/x", 113, lambda u, timeout=15: b'{"weird": true}') is None
+
+
+# --------------------------------------------- v0.9.0 consistency economics
+
+def _econ_record():
+    """Two executed orders. Order A: winner X (surplus 300 via amounts) and
+    loser Y (surplus 100). Order B: winner X only. A filtered-out bid with a
+    huge surplus must not count."""
+    return {
+        "auctionId": 7,
+        "solutions": [
+            {"solverAddress": "0xX", "score": "1", "isWinner": True,
+             "filteredOut": False, "orders": [
+                 {"id": "0xAA", "sellAmount": "1000", "buyAmount": "1300"},
+                 {"id": "0xBB", "sellAmount": "500", "buyAmount": "600"}]},
+            {"solverAddress": "0xY", "score": "1", "isWinner": False,
+             "filteredOut": False, "orders": [
+                 {"id": "0xAA", "sellAmount": "1000", "buyAmount": "1100"}]},
+            {"solverAddress": "0xZ", "score": "9", "isWinner": False,
+             "filteredOut": True, "orders": [
+                 {"id": "0xAA", "sellAmount": "1000", "buyAmount": "99999"}]},
+        ],
+    }
+
+
+def _econ_body():
+    # sell orders, limit 1000 -> 1000: surplus = buy_exec - 1000
+    return {"orders": [
+        {"uid": "0xaa", "kind": "sell", "sellAmount": "1000",
+         "buyAmount": "1000", "sellToken": "0xS", "buyToken": "0xB"},
+        {"uid": "0xbb", "kind": "sell", "sellAmount": "500",
+         "buyAmount": "500", "sellToken": "0xS", "buyToken": "0xB"},
+    ]}
+
+
+def test_executed_order_surpluses_and_terms():
+    from cow_backtester import economics
+    refs = {"0xb": 10**18}  # 1:1 native
+    table = economics.executed_order_surpluses(_econ_record(), _econ_body(), refs)
+    # order AA: X surplus 300, Y surplus 100; filtered Z absent
+    assert table["0xaa"] == {"0xx": 300, "0xy": 100}
+    # order BB: X surplus 100
+    assert table["0xbb"] == {"0xx": 100}
+
+    field, ch, cho = economics.consistency_terms(table)
+    # X: 300/400 + 100/100 = 1.75 ; Y: 100/400 = 0.25
+    assert field["0xx"] == pytest.approx(1.75)
+    assert field["0xy"] == pytest.approx(0.25)
+    assert ch == 0 and cho == 0
+
+    # challenger bids 400 on AA only: term = 400/(400+400) = 0.5
+    field2, ch2, cho2 = economics.consistency_terms(table, {"0xAA": 400})
+    assert ch2 == pytest.approx(0.5) and cho2 == 1
+    assert field2 == field  # historical terms unchanged (labeled conservative)
+
+
+def test_aggregate_report_share_and_budget():
+    from cow_backtester import economics
+    rows = [
+        {"field": {"0xx": 1.75, "0xy": 0.25}, "challenger": 0.5,
+         "challenger_orders": 1, "executed_orders": 2, "challenger_won": False},
+        {"field": {"0xx": 1.0}, "challenger": 1.0,
+         "challenger_orders": 1, "executed_orders": 1, "challenger_won": True},
+    ]
+    rep = economics.aggregate_report(rows, "mine", budget_cow=1000.0,
+                                     self_address="0xY")
+    assert rep["challenger_metric"] == pytest.approx(1.5)
+    # pool = (1.75+0.25+1.0) + 1.5 = 4.5 ; share = 1.5/4.5
+    assert rep["challenger_share_pct"] == pytest.approx(33.33, abs=0.01)
+    assert rep["win_floor_met"] is True and rep["counterfactual_wins"] == 1
+    assert rep["consistency_cow_estimate"] == pytest.approx(333.33, abs=0.01)
+    assert rep["historical_self_metric"] == pytest.approx(0.25)
+    assert rep["field_leaderboard"][0]["solver"] == "0xx"
+    assert economics.aggregate_report([], "mine") is None
+
+
+def test_aggregate_report_zero_win_note():
+    from cow_backtester import economics
+    rows = [{"field": {"0xx": 1.0}, "challenger": 0.9,
+             "challenger_orders": 1, "executed_orders": 1,
+             "challenger_won": False}]
+    rep = economics.aggregate_report(rows, "mine", budget_cow=100.0)
+    assert rep["win_floor_met"] is False
+    assert "consistency_cow_estimate_note" in rep

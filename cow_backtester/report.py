@@ -118,6 +118,25 @@ def render(summary, rows, path):
         p.append('<p class="note">Indicative: replayed against <b>live</b> liquidity and scored '
                  'vs the historical winning set. Prices are claimed by the solver, not simulated.</p>')
 
+    # consistency economics (--reward-ev)
+    for s in solvers:
+        ec = s.get("consistency")
+        if not ec:
+            continue
+        p.append(f"<h2>Consistency economics — {_esc(s['name'])} <span class='sub'>(CIP-85 v2 proxy)</span></h2>")
+        floor = "met" if ec.get("win_floor_met") else "NOT met (zero-win chains pay zero)"
+        est = (f' · est. <b>{_esc(ec.get("consistency_cow_estimate"))} COW</b> of a '
+               f'{_esc(ec.get("budget_cow"))} COW budget'
+               if ec.get("consistency_cow_estimate") is not None else "")
+        p.append(f'<p class="sub">metric {_esc(ec["challenger_metric"])} over '
+                 f'{ec["challenger_orders_bid"]}/{ec["executed_orders"]} executed orders · '
+                 f'pool share {_esc(ec["challenger_share_pct"])}% · win floor {floor}{est}</p>')
+        p.append("<div class='scroll'><table><tr><th>field solver</th><th>metric</th></tr>")
+        for e in ec.get("field_leaderboard", []):
+            p.append(f"<tr><td><code>{_esc(e['solver'])}</code></td><td>{_esc(e['metric'])}</td></tr>")
+        p.append("</table></div>")
+        p.append(f'<p class="note">{_esc(ec.get("basis", ""))}</p>')
+
     # field ranking (--compete)
     for s in solvers:
         ft = s.get("field")

@@ -80,6 +80,20 @@ on any of the supported chains, so you can readiness-check an endpoint for a
 chain you are not yet onboarded on. It is a signal, not a settlement
 guarantee — pair it with a self-hosted shadow run before going to production.
 
+## Consistency economics (`--reward-ev`)
+
+On most CoW chains the money is not in winning — it is in the CIP-85
+consistency pool, which pays
+`success_rate × Σ executed orders ( your best fair bid's surplus / everyone's )`.
+`--reward-ev` computes exactly that metric from the competition records:
+your solver's counterfactual metric and pool share, every field solver's
+real historical metric (a consistency leaderboard for the window), and,
+with `--consistency-budget <COW>`, a COW/week estimate. The win floor is
+reported explicitly — v2 pays zero on a chain where a solver won nothing in
+the period — and every number carries its basis label (field surpluses are
+net of protocol fees, a replayed challenger's are gross; challenger
+fairness is assumed while the field uses CoW's own `filteredOut` flags).
+
 ## Rank against the historical field (`--compete`)
 
 Capture ratio tells you how much surplus you generate; `--compete` tells you
@@ -254,6 +268,8 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--compete` | rank the challenger against the historical fairness-surviving field (rank / gap / rivals) |
 | `--archive-dir DIR` | persist competition records as `DIR/<chain>/<id>.json.gz` (local dataset) |
 | `--self-address 0x…` | your historical solverAddress → shadow-vs-actual comparison |
+| `--reward-ev` | CIP-85 v2 consistency economics: counterfactual metric, field leaderboard, COW estimate (implies `--compete`) |
+| `--consistency-budget N` | the chain's weekly consistency pool in COW, to convert share → COW/week |
 | `--min-evidence N` | attempted-auction floor before `--readiness` may say READY (default 10) |
 | `--clamp-validto` | extend expired `validTo` so engines that filter them still solve |
 | `--max-age-hours H` | warn when replayed auctions are older than this |

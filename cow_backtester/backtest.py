@@ -49,7 +49,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
-from . import competition, scorer
+from . import competition, economics, scorer
 from .cache import Cache
 from .scorer import VERSION, _ceildiv
 
@@ -393,11 +393,12 @@ def validate_and_score(resp, body, ref_prices):
     """
     out = {"best_surplus_wei": 0, "best_single_wei": 0, "n_solutions": 0,
            "n_valid": 0, "invalid": {}, "jit_ignored": 0, "no_refprice": 0,
-           "by_pair": {}}
+           "by_pair": {}, "by_order": {}}
     if not isinstance(resp, dict) or not isinstance(resp.get("solutions"), list):
         return out
     by_uid = {o["uid"].lower(): o for o in body.get("orders", [])}
     invalid = Counter()
+    best_by_order = {}
     candidates = []          # (surplus_wei, frozenset(pairs), {pair: wei})
 
     for sol in resp["solutions"]:
@@ -443,6 +444,7 @@ def validate_and_score(resp, body, ref_prices):
 
             total, scored = 0, 0
             pair_wei = defaultdict(int)
+            order_wei = {}
             for uid, fills in fulfills.items():
                 if len(fills) > 1:
                     reasons.add("duplicate_trade")
@@ -492,6 +494,7 @@ def validate_and_score(resp, body, ref_prices):
                 wei = scorer.to_native(s_atoms, ref)
                 total += wei
                 pair_wei[(st, bt)] += wei
+                order_wei[uid] = wei
                 scored += 1
 
             if reasons:
@@ -502,9 +505,17 @@ def validate_and_score(resp, body, ref_prices):
                 continue
             out["n_valid"] += 1
             candidates.append((total, frozenset(pair_wei), dict(pair_wei)))
+            # best valid bid per order across this response's solutions — the
+            # CIP-85 v2 consistency metric is built from the solver's BEST
+            # fair bid on each executed order
+            for uid, wei in order_wei.items():
+                if wei > best_by_order.get(uid, -1):
+                    best_by_order[uid] = wei
         except (_Malformed, TypeError, AttributeError, KeyError):
             invalid["malformed"] += 1
             continue
+
+    out["by_order"] = {u: w for u, w in best_by_order.items()}
 
     combined, chosen, combiner = _best_disjoint_combination(candidates)
     by_pair = defaultdict(int)
@@ -722,7 +733,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                               "attempted": 0, "winner_surplus_attempted": 0,
                               "lost_to_errors": 0,
                               "our_surplus_exact": 0, "winner_surplus_exact": 0,
-                              "rank_rows": [],
+                              "rank_rows": [], "econ_rows": [],
                               "invalid": Counter(), "errors": Counter(),
                               "latency": [], "late": 0}
                   for s in args.solvers}
@@ -846,6 +857,10 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                         agg["competition_archived"] += 1
                 else:
                     agg["competition_missing"] += 1
+            econ_table = None
+            if comp_rec is not None and getattr(args, "reward_ev", False):
+                econ_table = economics.executed_order_surpluses(
+                    comp_rec, body, ref_prices)
 
             if args.solvers:
                 expired = sum(1 for o in body.get("orders", [])
@@ -931,6 +946,17 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                         if fr:
                             vs_row["field_rank"] = fr
                             st["rank_rows"].append(fr)
+                    if econ_table is not None:
+                        field_t, ch_t, ch_orders = economics.consistency_terms(
+                            econ_table, vs.get("by_order"))
+                        st["econ_rows"].append({
+                            "field": field_t,
+                            "challenger": ch_t,
+                            "challenger_orders": ch_orders,
+                            "executed_orders": len(econ_table),
+                            "challenger_won":
+                                (vs_row.get("field_rank") or {}).get("rank") == 1,
+                        })
                     row["solvers"][sv["name"]] = vs_row
 
             rows.append(row)
@@ -1196,6 +1222,27 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         if cape is not None:
             print(f"  capture (exact-basis): {cape:.1f}%  (direct settlements only — "
                   f"same scoring basis both sides)")
+        econ = economics.aggregate_report(
+            s.get("econ_rows") or [], sv["name"],
+            budget_cow=getattr(args, "consistency_budget", None),
+            self_address=getattr(args, "self_address", None))
+        if econ:
+            print("  consistency (CIP-85 v2, proxy):")
+            print(f"    challenger metric : {econ['challenger_metric']} over "
+                  f"{econ['challenger_orders_bid']}/{econ['executed_orders']} "
+                  f"executed orders ({econ['auctions']} auctions)")
+            floor = ("MET" if econ["win_floor_met"]
+                     else "NOT met — zero-win chains pay ZERO")
+            print(f"    pool share        : {econ['challenger_share_pct']}%  "
+                  f"(win floor {floor})")
+            if "consistency_cow_estimate" in econ:
+                print(f"    est. consistency  : ~{econ['consistency_cow_estimate']} COW "
+                      f"of a {econ['budget_cow']} COW budget")
+            if "historical_self_metric" in econ:
+                print(f"    historical self   : {econ['historical_self_metric']} "
+                      f"(your REAL metric in these records)")
+            for e in econ["field_leaderboard"][:4]:
+                print(f"    field {e['solver'][:10]}  metric {e['metric']}")
         ft = competition.field_table(s.get("rank_rows") or [])
         if ft:
             print(f"  field rank (proxy)  : rank1 {ft['rank1_pct']}% / top3 "
@@ -1305,6 +1352,10 @@ def build_summary(st, args, extra, solver_names_map=None):
             "p50_ms": lat[len(lat) // 2] if lat else None,
             "p95_ms": lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else None,
             "field": competition.field_table(s.get("rank_rows") or []),
+            "consistency": economics.aggregate_report(
+                s.get("econ_rows") or [], sv["name"],
+                budget_cow=getattr(args, "consistency_budget", None),
+                self_address=getattr(args, "self_address", None)),
         })
     cov = {"settlement txs found": len(st["txs"]),
            "auctions formed": st["n_found"], "auctions scored": len(st["rows"])}
@@ -1387,6 +1438,15 @@ def main():
                     help="persist fetched competition records as "
                          "DIR/<chain>/<auction_id>.json.gz (implies fetching; "
                          "builds the local competition dataset)")
+    ap.add_argument("--reward-ev", action="store_true",
+                    help="estimate CIP-85 v2 consistency economics: the "
+                         "challenger's counterfactual metric vs the historical "
+                         "field, a field consistency leaderboard, and a COW "
+                         "estimate when --consistency-budget is given "
+                         "(implies --compete)")
+    ap.add_argument("--consistency-budget", type=float, default=None,
+                    help="the chain's weekly consistency pool in COW; converts "
+                         "the challenger's share into a COW/week estimate")
     ap.add_argument("--self-address", default=None,
                     help="your historical solverAddress — adds shadow-vs-actual "
                          "comparison when it appears in a competition record")
@@ -1474,6 +1534,8 @@ def main():
             sys.exit(1)
         say("      reachable")
 
+    if getattr(args, "reward_ev", False):
+        args.compete = True
     cache = Cache(args.cache_dir, args.chain, enabled=not args.no_cache)
 
     cycle = 0
