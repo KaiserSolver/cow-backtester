@@ -1,5 +1,7 @@
 # cow-backtester
 
+[![PyPI](https://img.shields.io/pypi/v/cow-backtester)](https://pypi.org/project/cow-backtester/)
+
 Offline backtester, A/B harness, and counterfactual scorecard for CoW Protocol
 solvers.
 
@@ -24,7 +26,7 @@ much?" the way you'd backtest a trading strategy. This tool does.
 Python 3.10+.
 
 ```bash
-pip install .          # installs the `cow-backtester` command (one dependency: eth_abi)
+pip install cow-backtester   # installs the `cow-backtester` command (one dependency: eth_abi)
 
 # 1. Baseline — what the field actually captured (no solver needed)
 cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc>
