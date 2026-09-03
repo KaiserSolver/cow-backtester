@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,12 +31,12 @@ jobs:
         run: |
           set -e
           cow-backtester --version
-          if cow-backtester --blocks 0 2>/dev/null; then
-            echo "usage error not detected"; exit 1
-          fi
-          if cow-backtester --from-block 100 --to-block 50 2>/dev/null; then
-            echo "inverted window not detected"; exit 1
-          fi
+          # assert the exit CODE (2 = usage error): a traceback (1) or a missing
+          # binary (127) must not pass as "usage error detected"
+          cow-backtester --blocks 0 2>/dev/null; rc=$?
+          [ "$rc" -eq 2 ] || { echo "expected exit 2 for --blocks 0, got $rc"; exit 1; }
+          cow-backtester --from-block 100 --to-block 50 2>/dev/null; rc=$?
+          [ "$rc" -eq 2 ] || { echo "expected exit 2 for an inverted window, got $rc"; exit 1; }
           echo OK
 
   package:

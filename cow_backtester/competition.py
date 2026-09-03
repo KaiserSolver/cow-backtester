@@ -9,14 +9,18 @@ orders, per-solution `referenceScore`, the auction's native `prices`, and
 `auctionStartBlock` / `auctionDeadlineBlock` (the auction-cut context a
 settlement block cannot provide).
 
-Rank basis honesty: the API's `score` includes protocol fees on top of
-surplus; the challenger is ranked by its plain surplus (no fee uplift), so
-its rank is a floor, never flattery. Every rank output is labeled
-`rank_basis: "surplus_vs_score_proxy"` until fee-adjusted scoring lands.
+Rank basis: the challenger is ranked by its best SINGLE solution on the
+tool's uniform-price basis, which agrees with the API's official `score` to
+within 0.2% on live records (the uniform-vs-custom price wedge is the
+protocol fee the score adds back). The rank is therefore approximately exact,
+deviating only by a solver-determined fee (zero on chains where the driver
+bakes fees into custom prices) and by buy-order native conversion. Every rank
+output carries `rank_basis` naming what was compared.
 """
 import gzip
 import json
 import os
+import threading
 
 
 def fetch_competition(chain_api_base, auction_id, http_get, cache=None):
@@ -54,7 +58,10 @@ def archive_store(archive_dir, chain, record):
     if os.path.exists(path):
         return False
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    # process+thread-unique temp name: a --watch run and a manual run sharing
+    # an archive dir must not interleave into one .tmp and os.replace a
+    # corrupt gzip into place
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with gzip.open(tmp, "wt", encoding="utf-8") as f:
         json.dump(record, f, separators=(",", ":"))
     os.replace(tmp, path)
@@ -79,10 +86,11 @@ def _fair_scores(record):
 
 
 def rank_vs_field(record, our_score_wei, self_address=None):
-    """Insert a challenger score into the historical (fairness-surviving)
-    field. Ties rank the challenger BELOW the historical bid (it was there
-    first; also keeps the proxy conservative). Returns None if the record has
-    no rankable field."""
+    """Insert ONE challenger score (a single solution's — the protocol ranks
+    solutions, see backtest.challenger_rank) into the historical
+    fairness-surviving field. Ties rank the challenger BELOW the historical
+    bid (it was there first). Returns None if the record has no rankable
+    field."""
     field = _fair_scores(record)
     if not field:
         return None
@@ -99,7 +107,8 @@ def rank_vs_field(record, our_score_wei, self_address=None):
         "beats_winner": our_score_wei > winner_score,
         "filtered_out_bids": sum(1 for s in record.get("solutions") or []
                                  if s.get("filteredOut")),
-        "rank_basis": "surplus_vs_score_proxy",
+        "field_solvers": len({a for a, _ in field}),
+        "rank_basis": "solution_score_vs_field_scores",
     }
     if self_address:
         mine = [s for s in record.get("solutions") or []
@@ -138,7 +147,7 @@ def field_table(rank_rows, top_n=5):
         "top3_pct": round(100 * sum(1 for r in ranks if r <= 3) / n, 1),
         "median_rank": ranks[n // 2],
         "median_gap_bps": gaps[len(gaps) // 2] if gaps else None,
-        "rank_basis": "surplus_vs_score_proxy",
+        "rank_basis": rows[0].get("rank_basis", "solution_score_vs_field_scores"),
         "rivals": [{"solver": a,
                     "wins": v["wins"],
                     "median_gap_bps": (sorted(v["gaps"])[len(v["gaps"]) // 2]

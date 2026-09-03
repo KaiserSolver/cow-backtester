@@ -19,28 +19,41 @@ across solvers. That yields, per auction:
 - and, aggregated, a consistency share that converts to COW when a weekly
   budget is supplied.
 
+Basis (v0.10.0): the record's per-order executed amounts are NET of protocol
+fees while a replayed challenger is scored on the tool's uniform-price basis,
+which equals the official `score` (gross of protocol fees) to within 0.2% —
+dividing one by the other inflated the challenger's share ~1.4x on measured
+records. So a field solution carrying exactly ONE order now contributes that
+solution's `score` (the score-basis surplus of that order); multi-order
+solutions fall back to the per-order net computation and are counted under
+`net_basis_orders` so the residual mixing is disclosed, never silent.
+
 Honesty labels (same doctrine as the rest of the tool):
-- `basis`: field surpluses come from record amounts (net of protocol fees);
-  a replayed challenger's come from its raw response (gross of fees) — a few
-  bps flattering to the challenger on fee-bearing orders.
 - `fairness`: the challenger's bids are ASSUMED fairness-surviving; the
   historical field uses CoW's actual `filteredOut` flags.
 - `success_rate` is reported as a separate flag (`win_floor_met`), never
-  silently folded in: a chain with zero wins in the period pays zero.
+  silently folded in: a chain with zero wins in the period pays zero. The
+  challenger's estimate therefore assumes success_rate = 1.
+- auctions where the challenger ERRORED stay in both sides with a zero
+  challenger term (the field still earned its terms there).
 """
 from collections import defaultdict
 
 from . import scorer
 
 
-def executed_order_surpluses(record, body, ref_prices):
-    """Per executed order, each non-filtered solver's surplus in native wei.
+def executed_order_surpluses(record, body, ref_prices, stats=None):
+    """Per executed order, each non-filtered solver's surplus in native wei,
+    on the SCORE basis where the record allows it.
 
     Executed orders = the union of order ids in winning solutions. For every
-    non-filteredOut solution touching such an order, surplus = the solution's
-    executed amounts vs the body's signed limits, valued at the auction's
-    reference price (the same basis for every solver, so the metric's RATIOS
-    are unaffected by the fee wedge in record amounts).
+    non-filteredOut solution touching such an order:
+    - a solution with exactly ONE order contributes its `score` — the official
+      score-basis surplus of that order, the same basis a replayed challenger
+      is scored on (`score_basis_orders` in `stats`);
+    - otherwise surplus = executed amounts vs the body's signed limits at the
+      auction reference price, which is NET of protocol fees and therefore
+      understates the score basis by the fee wedge (`net_basis_orders`).
 
     Returns {uid: {solver_address: best_surplus_wei}}.
     """
@@ -57,7 +70,20 @@ def executed_order_surpluses(record, body, ref_prices):
         if s.get("filteredOut"):
             continue
         solver = (s.get("solverAddress") or "").lower()
-        for o in s.get("orders") or []:
+        orders = s.get("orders") or []
+        if len(orders) == 1:
+            uid = (orders[0].get("id") or "").lower()
+            try:
+                score = int(s.get("score"))
+            except (TypeError, ValueError):
+                score = None
+            if uid in executed and score is not None and score > 0:
+                if stats is not None:
+                    stats["score_basis_orders"] += 1
+                if score > table[uid].get(solver, -1):
+                    table[uid][solver] = score
+                continue
+        for o in orders:
             uid = (o.get("id") or "").lower()
             if uid not in executed:
                 continue
@@ -83,9 +109,50 @@ def executed_order_surpluses(record, body, ref_prices):
                 wei = scorer.to_native(s_atoms, ref)
             except (KeyError, TypeError, ValueError):
                 continue
+            if stats is not None:
+                stats["net_basis_orders"] += 1
             if wei > table[uid].get(solver, -1):
                 table[uid][solver] = wei
     return {u: d for u, d in table.items() if d}
+
+
+def zero_challenger_row(surplus_table):
+    """The per-auction row for an auction where the challenger ERRORED (or
+    returned an unparseable response): the field's real terms, nothing for
+    us. Dropping such auctions from both sides inflated the share (measured
+    +27% with 3 of 10 auctions errored)."""
+    field, _ch, _n = consistency_terms(surplus_table)
+    return {"field": field, "challenger": 0.0, "challenger_orders": 0,
+            "executed_orders": len(surplus_table), "challenger_won": False}
+
+
+def field_leaderboard(field_rows, top_n=8, self_address=None):
+    """Window-level FIELD consistency leaderboard from per-auction field
+    terms — a purely historical quantity that needs no challenger and no
+    solver endpoint. field_rows: list of {solver: terms} dicts."""
+    rows = [r for r in field_rows if r]
+    if not rows:
+        return None
+    total = defaultdict(float)
+    for r in rows:
+        for solver, t in r.items():
+            total[solver] += t
+    pool = sum(total.values())
+    board = sorted(total.items(), key=lambda kv: -kv[1])
+    out = {
+        "auctions": len(rows),
+        "pool_metric": round(pool, 4),
+        "leaderboard": [{"solver": s, "metric": round(t, 4),
+                         "share_pct": round(100 * t / pool, 2) if pool else 0.0}
+                        for s, t in board[:top_n]],
+        "basis": "score basis for single-order solutions (official score), net-of-fee "
+                 "fallback for multi-order solutions; fairness per CoW's filteredOut flags",
+    }
+    if self_address:
+        mine = total.get(self_address.lower(), 0.0)
+        out["historical_self_metric"] = round(mine, 4)
+        out["historical_self_share_pct"] = round(100 * mine / pool, 2) if pool else 0.0
+    return out
 
 
 def consistency_terms(surplus_table, challenger_by_order=None):
@@ -137,9 +204,11 @@ def aggregate_report(per_auction, challenger_name, budget_cow=None,
         executed_total += r["executed_orders"]
         wins += bool(r.get("challenger_won"))
     # Challenger share of the (challenger-inclusive) pool. Field terms keep
-    # their historical denominators — the small cross-term (our presence
-    # shrinking THEIR terms) is ignored, which UNDERSTATES our share slightly:
-    # conservative direction, labeled below.
+    # their historical denominators — the cross-term (our presence shrinking
+    # THEIR terms) is ignored, which understates our share somewhat; the
+    # basis mismatch that used to OVERSTATE it (net field vs gross challenger)
+    # is fixed at the source (executed_order_surpluses), so the residual
+    # direction is conservative on records made of single-order solutions.
     pool = sum(field_total.values()) + challenger_sum
     share = challenger_sum / pool if pool > 0 else 0.0
     leaderboard = sorted(field_total.items(), key=lambda kv: -kv[1])[:top_n]
@@ -154,9 +223,11 @@ def aggregate_report(per_auction, challenger_name, budget_cow=None,
         "counterfactual_wins": wins,
         "field_leaderboard": [
             {"solver": s, "metric": round(t, 4)} for s, t in leaderboard],
-        "basis": "field=record-amounts(net-of-fees) vs challenger=raw-response; "
-                 "challenger fairness assumed; share is a conservative floor "
-                 "(field denominators keep historical values)",
+        "basis": "field=score basis (single-order solutions) with net-of-fee fallback "
+                 "(multi-order) vs challenger=uniform-price basis (== score within 0.2%); "
+                 "challenger fairness and success_rate=1 assumed; errored auctions kept "
+                 "with a zero challenger term; field denominators keep historical values "
+                 "(cross-term ignored)",
     }
     if self_address:
         out["historical_self_metric"] = round(

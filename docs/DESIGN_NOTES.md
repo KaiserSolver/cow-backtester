@@ -52,9 +52,13 @@ The test suite pins these constants.
 
 ## Design decisions
 
-- Before-fee surplus basis (= user surplus + protocol fees + network fee):
-  the only basis we found that can be computed symmetrically offline for both
-  sides. The README documents how it differs from CoW's official ranking score.
+- Before-fee surplus basis at uniform prices: the only basis we found that
+  can be computed symmetrically offline for both sides. Measured against the
+  official CIP-38 `score` on live records it agrees to within 0.2% — the
+  uniform-vs-custom price wedge is the protocol fee the score adds back (the
+  earlier "overstates by the network fee" note compared against after-fee
+  surplus, not the score). The README documents the residual deviations
+  (solver-determined fees, buy-order native conversion).
 - On-chain winner reconstruction rather than the competition API:
   trustless, retention-independent, verifiable; `--verify-api` cross-checks
   where the v2 endpoint has data.
@@ -62,5 +66,8 @@ The test suite pins these constants.
   fills, fees) but does not execute routes; implausible results are flagged,
   not hidden.
 - Fork-at-block replay is out of scope: a solver's RPC configuration
-  cannot be injected per-request; rows carry `block` so a cooperating solver
-  can be pointed at a pinned fork externally.
+  cannot be injected per-request. Rows carry `settlement_block` (the block
+  the winning settlement landed in — LATER than the auction cut, so a fork
+  pinned there can include the settlement itself) and, when `--compete`
+  fetched the record, `auction_start_block` / `auction_deadline_block`, which
+  is the state bidders actually saw; pin a cooperating solver's fork there.

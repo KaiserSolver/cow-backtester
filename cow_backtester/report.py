@@ -153,9 +153,27 @@ def render(summary, rows, path):
             p.append(f"<tr><td><code>{_esc(rv['solver'])}</code></td>"
                      f"<td>{rv['wins']}</td><td>{_esc(rv['median_gap_bps'])}</td></tr>")
         p.append("</table></div>")
-        p.append('<p class="note">Rank basis: challenger surplus inserted into the '
-                 'fairness-surviving historical score list (scores include protocol '
-                 'fees, surplus does not — the rank is a floor, not flattery).</p>')
+        p.append('<p class="note">Rank basis: the challenger\'s best SINGLE solution, on the '
+                 'tool\'s uniform-price basis (within 0.2% of the official score on live '
+                 'records), inserted into the fairness-surviving historical score list. '
+                 'The combined multi-solution total is not a bid the protocol sees and is '
+                 'not used for ranks.</p>')
+
+    # field consistency leaderboard (--reward-ev; needs no solver)
+    fc = summary.get("field_consistency")
+    if fc:
+        p.append("<h2>Field consistency <span class='sub'>(CIP-85 v2 metric, historical)</span></h2>")
+        p.append(f'<p class="sub">{fc["auctions"]} auctions with a competition record · pool metric '
+                 f'{_esc(fc["pool_metric"])}</p>')
+        p.append("<div class='scroll'><table><tr><th>solver</th><th>metric</th><th>share</th></tr>")
+        for e in fc.get("leaderboard", []):
+            p.append(f"<tr><td><code>{_esc(e['solver'])}</code></td><td>{_esc(e['metric'])}</td>"
+                     f"<td>{_esc(e['share_pct'])}%</td></tr>")
+        p.append("</table></div>")
+        if "historical_self_metric" in fc:
+            p.append(f'<p class="note">your historical metric: {_esc(fc["historical_self_metric"])} '
+                     f'({_esc(fc.get("historical_self_share_pct"))}% of the pool)</p>')
+        p.append(f'<p class="note">{_esc(fc.get("basis", ""))}</p>')
 
     # head-to-head
     h2h = summary.get("head_to_head")

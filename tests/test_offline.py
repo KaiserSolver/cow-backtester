@@ -647,7 +647,7 @@ def test_rank_vs_field_excludes_filtered_and_ranks_floor():
     assert fr["rank"] == 2 and fr["field_size"] == 3
     assert fr["winner_solver"] == "0xaaa1"
     assert fr["filtered_out_bids"] == 1
-    assert fr["rank_basis"] == "surplus_vs_score_proxy"
+    assert fr["rank_basis"] == "solution_score_vs_field_scores"
     assert fr["gap_to_winner_bps"] == 500.0  # (1000-950)/1000
     # tie ranks BELOW the historical bid (conservative)
     assert competition.rank_vs_field(rec, 1000)["rank"] == 2
@@ -721,9 +721,10 @@ def test_fetch_competition_offline_paths():
 # --------------------------------------------- v0.9.0 consistency economics
 
 def _econ_record():
-    """Two executed orders. Order A: winner X (surplus 300 via amounts) and
-    loser Y (surplus 100). Order B: winner X only. A filtered-out bid with a
-    huge surplus must not count."""
+    """Two executed orders. Order A: winner X (2-order solution -> net
+    amounts, surplus 300) and loser Y (1-order solution -> its score, 100).
+    Order B: winner X only. A filtered-out bid with a huge surplus must not
+    count."""
     return {
         "auctionId": 7,
         "solutions": [
@@ -731,7 +732,8 @@ def _econ_record():
              "filteredOut": False, "orders": [
                  {"id": "0xAA", "sellAmount": "1000", "buyAmount": "1300"},
                  {"id": "0xBB", "sellAmount": "500", "buyAmount": "600"}]},
-            {"solverAddress": "0xY", "score": "1", "isWinner": False,
+            # single-order solution: contributes its SCORE (score basis, v0.10.0)
+            {"solverAddress": "0xY", "score": "100", "isWinner": False,
              "filteredOut": False, "orders": [
                  {"id": "0xAA", "sellAmount": "1000", "buyAmount": "1100"}]},
             {"solverAddress": "0xZ", "score": "9", "isWinner": False,

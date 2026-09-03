@@ -59,27 +59,35 @@ cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc> \
         --solver-url http://localhost:8080 --solver-name mine --readiness
 ```
 
-It replays recent auctions against your endpoint and reports the four things
-that gate a pre-prod solver — does it answer, is it fast enough, are its
-solutions valid, and are they competitive with the on-chain winners — as
-pass/warn checks with a `READY` / `REVIEW` / `NOT READY` verdict:
+It replays recent auctions against your endpoint and reports up to eleven
+checks across four dimensions — does it answer, is it fast enough, are its
+solutions valid, are they competitive with the on-chain winners — plus how
+complete the field it was measured against actually was, as pass/warn checks
+with a `READY` / `REVIEW` / `NOT READY` verdict (real output, our own solver):
 
 ```
 ====================================================================
-  READINESS — mine   [REVIEW]
-  base · prod · blocks 49506127..49510000
+  READINESS — kaisersolver   [REVIEW]
+  base · prod · blocks 50314011..50316011
 ====================================================================
-  [PASS] reached auctions         50 auctions attempted
-  [WARN] no transport errors      2/50 errored
-  [PASS] answers reliably         96% returned a solution
+  [PASS] reached auctions         25 auctions attempted
+  [PASS] no transport errors      0 errors
+  [PASS] answers reliably         100% returned a parseable response (incl. legitimate empty solutions)
+  [PASS] bid coverage             64% of answered auctions carried >=1 solution
   [PASS] inside the deadline      0 past deadline
-  [PASS] latency headroom         p95 420 ms of a 15000 ms budget
-  [PASS] solutions are valid      98% passed limit/fee checks
-  [PASS] competitive vs winners   61% of winner surplus captured
+  [PASS] latency headroom         p95 1548 ms of a 20000 ms budget
+  [PASS] solutions are valid      100% of bid auctions had >=1 valid solution
+  [WARN] competitive vs winners   43% of winner surplus captured (coverage-adjusted; 43% conditional on answering)
+  [WARN] prices look plausible    1 auction(s) flagged implausible_surplus
+  [PASS] scan coverage            every block in the window was scanned
+  [PASS] field coverage           75 settlements, 71 auctions formed, 0 excluded (0% of field; reasons in the coverage block)
 ```
 
 It prints the exact `--from-block/--to-block` command to reproduce the run,
-and the same data lands in `--json-out`/`--html-out` under `readiness`. Works
+and the same data lands in `--json-out`/`--html-out` under `readiness`
+(including `unscanned_blocks` and every skip reason). `--fail-on not-ready`
+(or `review`) turns it into a CI gate: exit code 4 when the verdict trips.
+The screen prints even under `--quiet`, which silences progress only. Works
 on any of the supported chains, so you can readiness-check an endpoint for a
 chain you are not yet onboarded on. It is a signal, not a settlement
 guarantee — pair it with a self-hosted shadow run before going to production.
@@ -89,14 +97,18 @@ guarantee — pair it with a self-hosted shadow run before going to production.
 On most CoW chains the money is not in winning — it is in the CIP-85
 consistency pool, which pays
 `success_rate × Σ executed orders ( your best fair bid's surplus / everyone's )`.
-`--reward-ev` computes exactly that metric from the competition records:
-your solver's counterfactual metric and pool share, every field solver's
-real historical metric (a consistency leaderboard for the window), and,
-with `--consistency-budget <COW>`, a COW/week estimate. The win floor is
-reported explicitly — v2 pays zero on a chain where a solver won nothing in
-the period — and every number carries its basis label (field surpluses are
-net of protocol fees, a replayed challenger's are gross; challenger
-fairness is assumed while the field uses CoW's own `filteredOut` flags).
+`--reward-ev` computes the Σ term of that metric from the competition
+records: your solver's counterfactual metric and pool share, every field
+solver's real historical metric (a consistency leaderboard for the window —
+this needs no `--solver-url` at all), and, with `--consistency-budget <COW>`,
+a COW/week estimate. `success_rate` is not folded in silently: the win floor
+is reported as a flag — v2 pays zero on a chain where a solver won nothing in
+the period — and the estimate assumes it is met. Bases are matched: a field
+solution carrying one order contributes its official `score`, the same basis
+the replayed challenger is scored on (multi-order solutions fall back to the
+net-of-fee per-order computation and are counted as such); auctions where
+your solver errored stay in the denominator with a zero term; challenger
+fairness is assumed while the field uses CoW's own `filteredOut` flags.
 
 ## Rank against the historical field (`--compete`)
 
@@ -125,7 +137,7 @@ shadow-vs-actual side by side.
 
 ### Try it without a solver
 
-The bundled mock solver lets you see the full counterfactual/A/B output in
+The mock solver in the source checkout (`mock_solver.py`; not installed by the wheel) lets you see the full counterfactual/A/B output in
 about a minute, before wiring up your own engine:
 
 ```bash
@@ -175,14 +187,20 @@ auction's own reference prices.
   post-fee but a challenger pre-fee would bias every comparison.
 * Surplus token: buy token for sell orders, sell token for buy orders,
   converted at that token's `referencePrice` (matches official accounting).
-* What the number is: user surplus + protocol fees + network fee. CoW's
-  official ranking score is user surplus + protocol fees only, so absolute
-  levels here overstate the official score by the network fee (on the pinned
-  reference trade, a $2.4 fill where the network fee dominates: 1471 vs an
-  official 666 atoms; the gap shrinks as trades grow). When two solutions carry
-  very different fees this basis can order them differently than CoW would;
-  gas-heavy solutions are flattered. It is the only basis we found that can
-  be computed symmetrically offline for both sides.
+* What the number is: measured against the v2 competition API's official
+  `score` on seven live records (Arbitrum and Base, September 2026) this basis
+  agrees to within 0.2% — on the pinned reference settlement,
+  767,957,704,005 wei here vs an official 769,523,899,186. The CIP-38 score is
+  after-fee surplus plus protocol fees, and the uniform-vs-custom price wedge
+  this basis includes *is* the protocol fee (on Arbitrum and Base the driver
+  bakes it into the custom prices; solvers report `fee: 0`). Earlier releases
+  described this basis as "overstating the score by the network fee"; that
+  comparison used the after-fee surplus as the reference, not the score.
+  Residual deviations: a solver-determined fee (zero on those chains) is
+  included here and not in the score, and buy-order surplus is valued at the
+  sell token's reference price where the score converts at the limit ratio
+  into the buy token (about 8% of Base orders are buy-kind). It is the only
+  basis we found that can be computed symmetrically offline for both sides.
 
 ## Response validation (your solver can't accidentally cheat)
 
@@ -274,18 +292,29 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--self-address 0x…` | your historical solverAddress → shadow-vs-actual comparison |
 | `--reward-ev` | CIP-85 v2 consistency economics: counterfactual metric, field leaderboard, COW estimate (implies `--compete`) |
 | `--consistency-budget N` | the chain's weekly consistency pool in COW, to convert share → COW/week |
+| `--readiness` | one-screen pre-prod verdict for the endpoint(s) instead of the field scorecard |
 | `--min-evidence N` | attempted-auction floor before `--readiness` may say READY (default 10) |
+| `--fail-on not-ready\|review` | with `--readiness`: exit 4 when a verdict trips — a CI gate |
 | `--clamp-validto` | extend expired `validTo` so engines that filter them still solve |
 | `--max-age-hours H` | warn when replayed auctions are older than this |
 | `--watch N` | continuous mode: rescan every N seconds from the last block |
-| `--quiet` | suppress progress (stderr); the scorecard still prints to stdout |
+| `--quiet` | suppress progress (stderr); the scorecard and the readiness screen still print to stdout |
 | `--version` | print version |
 
 Progress goes to **stderr**, the scorecard to **stdout** (`2>/dev/null` gives
 clean results; `--json-out`/`--html-out` are unaffected). Exit codes: **0**
-success, **1** runtime error, **2** usage error, **130** interrupted mid-run
-(a partial scorecard is printed when auctions had already been processed;
-stopping `--watch` during its idle sleep is a clean stop and exits 0).
+success, **1** runtime error, **2** usage error, **4** `--fail-on` readiness
+gate tripped, **130** interrupted mid-run (a partial scorecard is printed when
+auctions had already been processed; stopping `--watch` during its idle sleep
+is a clean stop and exits 0).
+
+A/B runs post byte-identical bodies to every solver **concurrently** under one
+shared deadline, so each endpoint gets the same inputs and the same wall-clock
+budget. Any HTTP 200 that is not `{"solutions": [...]}` is an error
+(`bad_schema`), never a healthy abstention; `{"solutions": []}` is the only
+legitimate empty answer. The JSONL `_meta` line carries `failed_ranges`,
+`unscanned_blocks`, `competition_missing` and `validto_clamped_auctions` so a
+pipeline inherits the run's coverage caveats.
 
 ## Caching
 
@@ -367,9 +396,12 @@ python3 -m cow_backtester --selftest         # network: counterfactual == winner
 
 The pinned reference (Arbitrum auction 8339027): decode integrity is exact
 against the GPv2 `Trade` event (2385773 atoms), before-fee surplus 1471 atoms,
-fee take 805. `mock_solver.py` (modes: empty / limit / better / hex / garbage /
-invalid) exercises the wire path including validation and implausibility
-guards. CI runs the offline suite on Python 3.10 and 3.12.
+protocol-fee wedge 805 atoms, 767,957,704,005 wei vs the official score of
+769,523,899,186. The network self-test picks a recent settlement automatically
+once the pinned auction ages out of the S3 bucket. `mock_solver.py` (modes:
+empty / limit / better / hex / garbage / invalid; from a source checkout, it is
+not installed by the wheel) exercises the wire path including validation and
+implausibility guards. CI runs the offline suite on Python 3.10, 3.12 and 3.13.
 
 ## Files
 
@@ -378,6 +410,8 @@ guards. CI runs the offline suite on Python 3.10 and 3.12.
 | `cow_backtester/scorer.py` | settlement decode: auction id + winner surplus |
 | `cow_backtester/backtest.py` | enumerate, group, replay, validate, scorecard |
 | `cow_backtester/cache.py` | immutable-fact content cache |
+| `cow_backtester/competition.py` | v2 competition records: fetch, archive, rank vs field |
+| `cow_backtester/economics.py` | CIP-85 v2 consistency metric, field leaderboard |
 | `cow_backtester/report.py` | single-file HTML report |
 | `mock_solver.py` | test/demo solver (six modes) |
 | `fixtures/` | pinned reference data for the offline tests |

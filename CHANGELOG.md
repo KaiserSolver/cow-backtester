@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.10.0 — 2026-09-03
+
+Metric-correctness batch from a six-lane review (scoring and CIP-85
+economics, orchestration and silent-zero paths, packaging and docs). The
+numbers people quote first:
+
+- **The basis label was wrong, in the direction that matters.** This tool's
+  uniform-price surplus agrees with CoW's official CIP-38 `score` to within
+  0.2% on live records (pinned reference: 767,957,704,005 vs
+  769,523,899,186 wei). Earlier releases said it "overstates the score by
+  the network fee (2.21x on the pinned trade)"; that comparison used the
+  after-fee surplus as the reference, not the score. The uniform-vs-custom
+  price wedge reported as `fee_wei` is the protocol fee the score adds back.
+  README, caveats, docstrings and the HTML report are restated; the
+  `fee_wei` JSON keys are kept for row stability.
+- **`--compete` ranks the right number.** The challenger is ranked by its
+  best SINGLE solution against the field's per-solution scores, as the
+  protocol ranks. The combined disjoint-solution total (what capture uses)
+  was being ranked before — three 400-wei solutions out-ranked a 1000-wei
+  winner and set `win_floor_met`. Rows carry `score_wei` and, when it
+  differs, `rank_combined` / `combined_score_wei`, labeled. Auctions
+  answered with no valid bid are counted (`rank_no_bid`) so "rank 1 in
+  100%" cannot hide a 5% bid rate; `rank_basis` is
+  `best_single_solution_vs_field_scores`.
+- **`--reward-ev` compares like with like.** The record's per-order
+  amounts are net of protocol fees while the challenger is scored gross;
+  the ratio inflated the challenger's share ~1.4x on measured records while
+  labeled "conservative". A field solution with one order now contributes
+  its official `score`; multi-order solutions fall back to the net
+  computation and are counted (`net_basis_orders`). Auctions where the
+  challenger errored stay in both sides with a zero term (dropping them
+  inflated the share +27% with 3 of 10 errored). The field consistency
+  leaderboard prints with `--reward-ev` alone — no `--solver-url` needed —
+  in the scorecard, JSON (`field_consistency`) and HTML.
+- **A/B solvers get the same wall-clock budget.** Bodies were byte-identical
+  but dispatched sequentially, so the second solver received a deadline the
+  first one's compute had already consumed (negative at the default 20 s
+  when the rival used its budget). All solvers now receive the same bytes
+  concurrently under the one deadline; call-order rotation is gone because
+  there is no order.
+- **A 200 that is not a `/solve` response is an error.** `{"error": …}`,
+  `{}`, a `solutions` dict or a typo'd key counted as a healthy abstention
+  with zero errors; readiness printed PASS for an endpoint that errored on
+  every auction. Now `bad_schema`; `{"solutions": []}` remains the only
+  legitimate empty answer.
+- **Unscanned blocks and every exclusion reach the readiness verdict.**
+  `failed_ranges` were visible only on stderr and in the full scorecard;
+  the readiness "field coverage" check counted two of ~eight skip reasons.
+  Readiness now has a `scan coverage` check (WARN on any unscanned span),
+  `field coverage` counts every reason that removes a settlement from the
+  baseline (a reverted settlement is not one), and the dict carries
+  `unscanned_blocks` and `skipped`. The JSONL `_meta` line carries
+  `failed_ranges`, `unscanned_blocks`, `competition_missing` and
+  `validto_clamped_auctions`.
+
+Also:
+
+- `--readiness --quiet` printed nothing and NOT READY exited 0. `--quiet`
+  now silences progress only; `--fail-on not-ready|review` exits 4 for CI.
+- Head-to-head `capture %` and `capture (exact-basis)` used answered-only
+  denominators (the survivorship bias 0.7.2 removed from the headline);
+  both now use attempted denominators, and the head-to-head shows `errored`.
+- Latency percentiles describe answers only; failed calls no longer buy a
+  dead endpoint a flattering p95.
+- `--clamp-validto` modifications are disclosed in the coverage block, the
+  readiness screen (`bodies unmodified` WARN), JSON and `_meta`.
+- S3 body failures are split: `s3_404` (retention), `s3_fetch_error`
+  (network/5xx, retried once), `s3_bad_body` — and the byte cap now bounds
+  the DECOMPRESSED body (a 1000x gzip bomb passed the wire cap).
+  Competition records fetched/missing are printed in the coverage block.
+- `preflight` treats 404/405 on POST `/solve` as the wrong-path error it is
+  (the tool appends `/solve`) instead of "reachable".
+- An `--archive-dir` write failure no longer aborts the window; the temp
+  file is process+thread-unique.
+- Native amounts below 0.0001 print in scientific notation instead of
+  `0.000000`; the head-to-head delta also prints in wei.
+- The network self-test picks a recent settlement automatically when the
+  pinned auction has aged out of the S3 bucket.
+- The deprecated `block` row alias (promised for one release in 0.7.2) is
+  removed; use `settlement_block`, or `auction_start_block` /
+  `auction_deadline_block` from `--compete` for the auction-cut state.
+- CI asserts the usage-error exit code is 2 (a traceback passed before),
+  tests Python 3.13, and `.gitignore` covers the HTML reports and archive
+  directories the README tells users to create in a checkout.
+- Tests: 26 new offline cases (`tests/test_v0_10.py`) reproduce each item;
+  the tautological `--max-auctions` test now exercises the real helper.
+
 ## 0.9.0 — 2026-08-18
 
 **`--reward-ev`: CIP-85 v2 consistency economics.** Capture ratios and ranks

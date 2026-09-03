@@ -28,15 +28,21 @@ Comparison basis (applied IDENTICALLY to winner and challenger):
     buy orders (matches autopilot's accounting), converted at that token's
     native referencePrice: wei = atoms * referencePrice / 1e18.
 
-  What this number IS: user surplus + protocol fees + network fee. CoW's
-  official ranking score is user surplus + protocol fees only, so absolute
-  levels here overstate the official score by the network-fee component (on
-  the pinned dust-sized reference trade, 1471 vs an official 666 atoms; the
-  gap shrinks as trades grow). Consequence: when two solutions carry very
-  different fees this basis can order them differently than CoW would. It is
-  the only basis we found that can be computed symmetrically offline: a /solve
-  response carries no protocol-fee information to subtract, and removing fees
-  from the winner alone would bias the comparison the other way.
+  What this number IS: measured against the v2 competition API's official
+  `score` on 7 live records (Arbitrum + Base, 2026-09-03) this basis agrees to
+  within 0.2% (pinned reference: 767,957,704,005 vs an official
+  769,523,899,186 wei). Mechanism: the CIP-38 score is after-fee surplus PLUS
+  protocol fees, and the uniform-vs-custom price wedge this basis includes IS
+  the protocol fee (the driver forwards fee policies to solvers only under
+  FeeHandler::Solver; on Arbitrum/Base solvers report fee=0 and the protocol
+  fee is baked into the custom prices). The earlier "1471 vs an official 666
+  atoms" comparison used the AFTER-fee surplus as the reference, not the
+  score. Residual deviations: a solver-determined fee (zero on those chains)
+  is included here and not in the score; buy-order surplus is valued at the
+  sell token's reference price where the score converts at the limit ratio
+  into the buy token (measured +5% on a deep-out-of-market example; ~8% of
+  Base orders are buy-kind). It is the only basis computable symmetrically
+  offline: a /solve response carries no fee-policy information.
 
 Why on-chain and not the competition API: the v1 /solver_competition endpoints
 were removed in the competition-data migration, and the v2 replacement is
@@ -333,7 +339,9 @@ def winner_settlement_surplus(decoded, events, body, ref_prices):
     Returns error='trade_event_mismatch' when the receipt's Trade events don't
     align 1:1 with calldata trades (never silently misattributes).
     Also reports per-trade fee_wei = (uniform - custom) delivery valued at the
-    referencePrice — the settlement's total fee take, a useful diagnostic.
+    referencePrice — the PROTOCOL-fee wedge (it equals the protocol fee when
+    the solver takes no solver-determined fee), a useful diagnostic. The key
+    name `fee_wei` is kept for JSON-row stability.
     """
     trades = decoded["trades"]
     if len(events) != len(trades):

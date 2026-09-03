@@ -17,10 +17,13 @@ what ACTUALLY won on-chain — no live shadow mode, no production risk, no keys.
 
 Comparison basis (identical on both sides — see scorer.py): before-fee surplus
 over the SIGNED order limits at uniform clearing prices, converted to the
-chain's native token at the auction's referencePrice. That equals user surplus
-+ protocol fees + network fee; CoW's official ranking score is user surplus +
-protocol fees only, so absolute levels here overstate the official score by the
-network-fee component (documented in README).
+chain's native token at the auction's referencePrice. Measured against the v2
+competition API's official `score` this basis agrees to within 0.2% (7 live
+records, Arbitrum + Base, 2026-09-03): the uniform-vs-custom price wedge IS the
+protocol fee, which the CIP-38 score adds back. It overstates the score only by
+a solver-determined fee (zero on chains where the driver bakes fees into the
+custom prices) and deviates on buy orders by the limit/market gap in the native
+conversion (documented in README).
 
 Winner data comes from on-chain settlements, not an API. Use --verify-api to
 cross-check the reconstruction against the (retention-bounded) v2 competition
@@ -37,6 +40,7 @@ Usage:
 
 import argparse
 import gzip
+import io
 import json
 import os
 import re
@@ -124,8 +128,11 @@ REORG_MARGIN = 32          # don't cache settlements newer than this many blocks
 CAVEATS = [
     "Replay uses LIVE liquidity; winners are historical. The counterfactual is indicative, "
     "not a claim about what would have happened at that block.",
-    "Surplus basis = user surplus + protocol fees + network fee (before-fee, signed limits, "
-    "uniform prices). CoW's official score excludes the network fee.",
+    "Surplus basis = before-fee surplus over signed limits at uniform prices. Measured "
+    "within 0.2% of CoW's official CIP-38 score on live records (the uniform-vs-custom wedge "
+    "is the protocol fee the score adds back); it overstates the score only by a "
+    "solver-determined fee, and values buy-order surplus at the sell token's reference "
+    "price where the score uses the limit ratio into the buy token.",
     "Beating the winning set is necessary, not sufficient: real winner selection also applies "
     "fairness filters and bids score net of gas.",
     "Solver prices are CLAIMED, not simulated. Feasibility is checked; routes are not executed.",
@@ -181,22 +188,53 @@ def _http_get(url, timeout=20):
     return data
 
 
-def s3_auction(env, chain, auction_id, cache=None):
-    """Archived /solve body (immutable, so always cacheable)."""
+def _gunzip_bounded(raw):
+    """Decompress with the byte cap applied to the DECOMPRESSED size — a
+    1000x gzip bomb passes the wire cap and would otherwise exhaust memory."""
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as g:
+        data = g.read(_MAX_HTTP_BYTES + 1)
+    if len(data) > _MAX_HTTP_BYTES:
+        raise ValueError(f"decompressed body exceeds {_MAX_HTTP_BYTES} bytes")
+    return data
+
+
+def s3_auction(env, chain, auction_id, cache=None, errors=None):
+    """Archived /solve body (immutable, so always cacheable). None when the
+    body is unavailable; the REASON is tallied into `errors` (a Counter) so a
+    transient 5xx storm is never mistaken for retention expiry:
+    s3_404 (evicted / never existed) · s3_fetch_error (network/5xx, retried
+    once) · s3_bad_body (not gzip/JSON, or over the decompressed cap)."""
     if cache:
         hit = cache.get(f"s3-{env}", auction_id)
         if hit is not None:
             return hit
     url = f"{BUCKET}/{env}/{chain}/auction/{auction_id}.json"
-    try:
-        raw = _http_get(url)
-        body = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
-        out = json.loads(body)
-    except Exception:
-        return None
-    if cache:
-        cache.put(f"s3-{env}", auction_id, out)
-    return out
+    for attempt in range(2):
+        try:
+            raw = _http_get(url)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                if errors is not None:
+                    errors["s3_404"] += 1
+                return None
+        except Exception:
+            pass
+        else:
+            try:
+                body = _gunzip_bounded(raw) if raw[:2] == b"\x1f\x8b" else raw
+                out = json.loads(body)
+            except Exception:
+                if errors is not None:
+                    errors["s3_bad_body"] += 1
+                return None
+            if cache:
+                cache.put(f"s3-{env}", auction_id, out)
+            return out
+        if attempt == 0:
+            time.sleep(0.5)
+    if errors is not None:
+        errors["s3_fetch_error"] += 1
+    return None
 
 
 def fetch_settlement_cached(rpcs, tx, cache, max_cacheable_block):
@@ -315,10 +353,17 @@ def token_symbol(body, addr):
 # ------------------------------------------------------------------ solving
 
 def solve(solver_url, auction_body, timeout):
-    """POST a /solve body. Returns (response|None, error|None, latency_ms).
-    The HTTP wait exceeds the advertised deadline so a solver computing right
-    up to its deadline is never cut off."""
-    body = json.dumps(auction_body).encode()
+    """POST a /solve body (a dict, or pre-serialized bytes so several solvers
+    receive byte-identical payloads). Returns (response|None, error|None,
+    latency_ms). The HTTP wait exceeds the advertised deadline so a solver
+    computing right up to its deadline is never cut off.
+
+    Only `{"solutions": [...]}` is an answer. Any other 200 body — an error
+    envelope, an empty object, a typo'd key — is `bad_schema`, an ERROR, so a
+    misrouted gateway or a crashing solver can never read as a healthy
+    abstention (v0.10.0; the empty list stays the legitimate abstention)."""
+    body = (bytes(auction_body) if isinstance(auction_body, (bytes, bytearray))
+            else json.dumps(auction_body).encode())
     req = urllib.request.Request(f"{solver_url.rstrip('/')}/solve", body,
                                  {"Content-Type": "application/json"})
     t0 = time.monotonic()
@@ -345,12 +390,89 @@ def solve(solver_url, auction_body, timeout):
         return None, "bad_json", ms
     if not isinstance(out, dict):
         return None, "bad_json", ms
+    if not isinstance(out.get("solutions"), list):
+        return None, "bad_schema", ms
     return out, None, ms
 
 
+def dispatch_solvers(solvers, payload, timeout):
+    """POST the SAME bytes to every solver CONCURRENTLY under the one shared
+    deadline, so an A/B compares identical inputs AND identical wall-clock
+    budgets. (Sequential dispatch handed the second solver a deadline already
+    consumed by the first one's compute — a handicap the size of the rival's
+    latency, which call-order rotation cannot neutralise; v0.10.0.)
+    Returns [(solver, response, error, latency_ms)] in `solvers` order."""
+    if len(solvers) == 1:
+        sv = solvers[0]
+        return [(sv, *solve(sv["url"], payload, timeout))]
+    with ThreadPoolExecutor(max_workers=len(solvers)) as pool:
+        return list(pool.map(lambda sv: (sv, *solve(sv["url"], payload, timeout)), solvers))
+
+
+def challenger_rank(comp_rec, vs, self_address=None):
+    """Rank the challenger the way the protocol ranks: by its best SINGLE
+    solution's score against the field's per-solution scores. The combined
+    disjoint-solution total (what capture metrics use) is NOT a bid the
+    protocol ever sees — three 400-wei solutions are three third-place bids,
+    not one 1200-wei winner — so it is reported alongside, labeled, never as
+    the rank (v0.10.0)."""
+    single = vs.get("best_single_wei", 0)
+    fr = competition.rank_vs_field(comp_rec, single, self_address)
+    if fr is None:
+        return None
+    fr["score_wei"] = single
+    fr["rank_basis"] = "best_single_solution_vs_field_scores"
+    combined = vs.get("best_surplus_wei", 0)
+    if combined != single:
+        fr2 = competition.rank_vs_field(comp_rec, combined)
+        fr["rank_combined"] = fr2["rank"]
+        fr["combined_score_wei"] = combined
+    return fr
+
+
+def select_newest(aids_sorted_asc, cap):
+    """--max-auctions keeps the NEWEST auctions (replay uses live liquidity,
+    so freshness is the whole game). cap 0 = all."""
+    if cap and len(aids_sorted_asc) > cap:
+        return aids_sorted_asc[-cap:]
+    return list(aids_sorted_asc)
+
+
+def _fmt_native(wei):
+    """Native amount for the scorecard: 6 decimals when that shows the value,
+    scientific notation below that — an L2 A/B whose whole result is a few
+    microether must not print as a tie of 0.000000."""
+    x = wei / 1e18
+    if x == 0:
+        return "0.000000"
+    if abs(x) >= 1e-4:
+        return f"{x:.6f}"
+    return f"{x:.3e}"
+
+
+# Skip reasons that REMOVE a settlement/auction from the winner baseline. A
+# reverted settlement is not a winner, so it is not an exclusion.
+_NON_EXCLUSION_SKIPS = {"settlement_reverted"}
+
+
+def exclusion_count(skip):
+    return sum(v for k, v in (skip or {}).items() if k not in _NON_EXCLUSION_SKIPS)
+
+
+def gate_failed(verdicts, fail_on):
+    """--fail-on: 'not-ready' trips on NOT READY; 'review' trips on REVIEW or
+    NOT READY; None never trips."""
+    if not fail_on:
+        return False
+    bad = {"NOT READY"} if fail_on == "not-ready" else {"NOT READY", "REVIEW"}
+    return any(v in bad for v in verdicts)
+
+
 def preflight(solver_url, timeout=10):
-    """Fail-fast reachability probe. Any HTTP response proves the endpoint is
-    alive. Returns (ok, reason)."""
+    """Fail-fast reachability probe. An HTTP response proves the endpoint is
+    alive — EXCEPT 404/405 on POST /solve, which means the wrong path (the tool
+    appends /solve; passing the full path is the most common user error, and
+    every replay would then error). Returns (ok, reason)."""
     minimal = {"id": "0", "orders": [], "tokens": {}, "liquidity": [],
                "effectiveGasPrice": "0",
                "deadline": (datetime.now(timezone.utc) + timedelta(seconds=5)
@@ -361,7 +483,11 @@ def preflight(solver_url, timeout=10):
     try:
         urllib.request.urlopen(req, timeout=timeout).read()
         return True, None
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 405):
+            return False, (f"HTTP {e.code} for POST {solver_url.rstrip('/')}/solve — the tool "
+                           f"appends /solve to --solver-url; pass the endpoint base "
+                           f"(e.g. http://host:8080), not the full /solve path")
         return True, None
     except urllib.error.URLError as e:
         reason = str(getattr(e, "reason", e)).lower()
@@ -698,7 +824,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
     if args.max_auctions and n_found > args.max_auctions:
         # Keep the NEWEST auctions: replay uses live liquidity, so freshness
         # is the whole game — the old head-of-list cap kept the stalest.
-        aids = aids[-args.max_auctions:]
+        aids = select_newest(aids, args.max_auctions)
         say(f"      {n_found} auctions found; capped to {len(aids)} newest "
               f"(per --max-auctions; NOT a full-field sample)")
     else:
@@ -707,9 +833,12 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
     # prefetch bodies concurrently (immutable and cached, so cheap on re-runs)
     say("[3/4] fetching auction bodies + winner baselines"
           + (f" + replaying {len(args.solvers)} solver(s)" if args.solvers else ""))
+    def _fetch_body(a):
+        errs = Counter()
+        b = s3_auction(args.env, args.chain, a, cache, errors=errs)
+        return b, (next(iter(errs)) if errs else None)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        bodies = dict(zip(aids, pool.map(
-            lambda a: s3_auction(args.env, args.chain, a, cache), aids), strict=True))
+        bodies = dict(zip(aids, pool.map(_fetch_body, aids), strict=True))
 
     rows = []
     field_by_bucket = defaultdict(lambda: [0, 0])
@@ -737,15 +866,16 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                               "invalid": Counter(), "errors": Counter(),
                               "latency": [], "late": 0}
                   for s in args.solvers}
+    field_econ = []      # per-auction FIELD consistency terms (needs no solver)
     now_ts = time.time()
     done = 0
 
     try:
-        for idx, aid in enumerate(aids):
+        for aid in aids:
             txrecs = auctions[aid]
-            body = bodies.get(aid)
+            body, body_err = bodies.get(aid, (None, None))
             if not body:
-                skip["s3_body_missing"] += 1
+                skip[body_err or "s3_body_missing"] += 1
                 continue
             ref_prices = {k.lower(): int(v["referencePrice"])
                           for k, v in body.get("tokens", {}).items()
@@ -823,9 +953,8 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
             total_fees += winner_fees
 
             # Highest SETTLEMENT block of the auction's txs — NOT the auction
-            # cut block (state at bid time is earlier). Exposed as
-            # `settlement_block`; `block` kept one release as a deprecated
-            # alias (v0.7.2).
+            # cut block (state at bid time is earlier; see auction_start_block
+            # / auction_deadline_block when --compete fetched the record).
             blk = max(r["block"] for r in txrecs)
             ts = block_ts(rpcs, blk, ts_mem, cache, max_cacheable)
             age_h = (now_ts - ts) / 3600 if ts is not None else None
@@ -833,7 +962,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 ages.append(age_h)
 
             row = {"v": VERSION, "chain": args.chain, "env": args.env, "auction_id": aid,
-                   "settlement_block": blk, "block": blk, "block_ts": ts,
+                   "settlement_block": blk, "block_ts": ts,
                    "age_hours": round(age_h, 2) if age_h is not None else None,
                    "winner_txs": winner_txs, "winner_surplus_wei": winner_total,
                    "winner_fee_wei": winner_fees, "baseline_quality": baseline_quality}
@@ -848,19 +977,30 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 api_base = f"{COW_API}/{CHAINS[args.chain]['api']}"
                 comp_rec = competition.fetch_competition(api_base, aid, _http_get, cache)
                 if comp_rec:
+                    agg["competition_fetched"] += 1
                     # The auction-CUT context (what bidders actually saw) —
                     # complements settlement_block, which is always later.
                     row["auction_start_block"] = comp_rec.get("auctionStartBlock")
                     row["auction_deadline_block"] = comp_rec.get("auctionDeadlineBlock")
-                    if args.archive_dir and competition.archive_store(
-                            args.archive_dir, args.chain, comp_rec):
-                        agg["competition_archived"] += 1
+                    if args.archive_dir:
+                        try:
+                            if competition.archive_store(args.archive_dir, args.chain, comp_rec):
+                                agg["competition_archived"] += 1
+                        except OSError as e:
+                            # a filesystem problem must not discard the
+                            # scored window
+                            agg["archive_error"] += 1
+                            if agg["archive_error"] == 1:
+                                say(f"      ⚠ --archive-dir write failed: {e}")
                 else:
                     agg["competition_missing"] += 1
             econ_table = None
             if comp_rec is not None and getattr(args, "reward_ev", False):
                 econ_table = economics.executed_order_surpluses(
-                    comp_rec, body, ref_prices)
+                    comp_rec, body, ref_prices, stats=agg)
+                # The field's real historical terms exist with or without a
+                # challenger — the consistency leaderboard needs no solver.
+                field_econ.append(economics.consistency_terms(econ_table)[0])
 
             if args.solvers:
                 expired = sum(1 for o in body.get("orders", [])
@@ -873,32 +1013,43 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                         if int(o.get("validTo", 0)) < now_ts:
                             o["validTo"] = horizon
                     row["validto_clamped"] = expired
+                    # Disclosed everywhere a verdict is read: a READY produced
+                    # from modified bodies must say so (coverage block,
+                    # readiness screen, _meta line).
+                    agg["validto_clamped_auctions"] += 1
+                    agg["validto_clamped_orders"] += expired
 
                 row["solvers"] = {}
-                # ONE shared deadline per auction (v0.7.2): computed before
-                # the solver loop so every endpoint receives byte-identical
-                # bodies — the per-request deadline regeneration broke the
-                # "A/B on identical inputs" guarantee.
+                # ONE shared deadline per auction, serialized ONCE, dispatched
+                # to every solver CONCURRENTLY: identical bytes and identical
+                # wall-clock budget (v0.7.2 made the bytes identical; v0.10.0
+                # makes the budget identical — sequential calls handed the
+                # second solver a deadline the first one had already consumed).
                 body["deadline"] = (datetime.now(timezone.utc)
                                     + timedelta(seconds=args.solve_timeout)
                                     ).isoformat().replace("+00:00", "Z")
                 row["replay_deadline"] = body["deadline"]
-                # rotate which solver goes first so neither gets a systematic
-                # first-mover advantage from chain state drifting between calls
-                order = args.solvers[idx % len(args.solvers):] + args.solvers[:idx % len(args.solvers)]
-                for sv in order:
-                    resp, err, ms = solve(sv["url"], body, args.solve_timeout)
+                payload = json.dumps(body).encode()
+                for sv, resp, err, ms in dispatch_solvers(args.solvers, payload, args.solve_timeout):
                     st = per_solver[sv["name"]]
                     st["attempted"] += 1
                     st["winner_surplus_attempted"] += winner_total
-                    st["latency"].append(ms)
-                    if ms > args.solve_timeout * 1000:
-                        st["late"] += 1
+                    if baseline_quality == "exact_uniform":
+                        # exact-basis denominator accrues on ATTEMPTED too, or
+                        # the "cleanest" number carries the survivorship bias
+                        # the headline was fixed for (v0.10.0)
+                        st["winner_surplus_exact"] += winner_total
+                    if econ_table is not None and comp_rec is not None:
+                        st["rank_eligible"] = st.get("rank_eligible", 0) + 1
                     if err:
                         st["errored"] += 1
                         st["errors"][err] += 1
                         st["lost_to_errors"] += winner_total
                         row["solvers"][sv["name"]] = {"solve_error": err, "latency_ms": ms}
+                        if econ_table is not None:
+                            # the field still earned its terms here; we earned
+                            # nothing — keep the auction in BOTH sides
+                            st["econ_rows"].append(economics.zero_challenger_row(econ_table))
                         continue
                     try:
                         vs = validate_and_score(resp, body, ref_prices)
@@ -909,13 +1060,19 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                         row["solvers"][sv["name"]] = {
                             "solve_error": f"bad_solver_response ({type(e).__name__})",
                             "latency_ms": ms}
+                        if econ_table is not None:
+                            st["econ_rows"].append(economics.zero_challenger_row(econ_table))
                         continue
+                    # latency describes ANSWERS; a dead endpoint's fast
+                    # failures must not buy it a flattering p95
+                    st["latency"].append(ms)
+                    if ms > args.solve_timeout * 1000:
+                        st["late"] += 1
                     st["replayed"] += 1
                     st["winner_surplus"] += winner_total
                     ours = vs["best_surplus_wei"]
                     st["our_surplus"] += ours
                     if baseline_quality == "exact_uniform":
-                        st["winner_surplus_exact"] += winner_total
                         st["our_surplus_exact"] += ours
                     if vs["n_solutions"]:
                         st["returned"] += 1
@@ -940,12 +1097,17 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     vs_row["latency_ms"] = ms
                     if implausible:
                         vs_row["flags"] = ["implausible_surplus"]
-                    if comp_rec is not None and args.compete and ours > 0:
-                        fr = competition.rank_vs_field(comp_rec, ours,
-                                                       args.self_address)
-                        if fr:
-                            vs_row["field_rank"] = fr
-                            st["rank_rows"].append(fr)
+                    if comp_rec is not None and args.compete:
+                        if vs["n_valid"]:
+                            fr = challenger_rank(comp_rec, vs, args.self_address)
+                            if fr:
+                                vs_row["field_rank"] = fr
+                                st["rank_rows"].append(fr)
+                        else:
+                            # answered with a record but placed no valid bid:
+                            # counted, so "rank 1 in 100%" cannot hide a 5%
+                            # bid rate
+                            st["rank_no_bid"] = st.get("rank_no_bid", 0) + 1
                     if econ_table is not None:
                         field_t, ch_t, ch_orders = economics.consistency_terms(
                             econ_table, vs.get("by_order"))
@@ -974,6 +1136,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
             "failed_ranges": failed_ranges, "field_by_bucket": field_by_bucket,
             "pair_stats": pair_stats, "submitters": submitters, "total_fees": total_fees,
             "agg": agg, "ages": ages, "per_solver": per_solver, "api_check": api_check,
+            "field_econ": field_econ,
             "interrupted": interrupted, "from_block": frm, "to_block": to, "native": nat}
 
 
@@ -1056,15 +1219,31 @@ def readiness_report(st, args):
             # Coverage disclosure: a verdict against a partial field is only
             # meaningful if the reader can see how partial. Never a hard fail
             # (it's environmental, not the solver's doing) — but >5% excluded
-            # downgrades to REVIEW so the number gets read.
+            # or ANY unscanned span downgrades to REVIEW so the number gets
+            # read. Every skip reason that removes a settlement from the
+            # baseline counts (v0.10.0; two of ~eight used to).
             found = len(st.get("txs") or [])
+            unscanned = sum(hi - lo + 1 for lo, hi in (st.get("failed_ranges") or []))
+            if unscanned:
+                span = (st.get("to_block", 0) - st.get("from_block", 0) + 1) or 1
+                chk(False, True, "scan coverage",
+                    f"{unscanned} of {span} blocks in the window were NOT scanned "
+                    f"(RPC getLogs failures) — the field is under-counted")
+            else:
+                chk(True, True, "scan coverage", "every block in the window was scanned")
             if found:
                 sk = st.get("skip") or {}
-                excl = (sk.get("wrapper_unattributed", 0)
-                        + sk.get("non_settle_entrypoint", 0))
+                excl = exclusion_count(sk)
                 chk(excl <= 0.05 * found, True, "field coverage",
                     f"{found} settlements, {st.get('n_found', 0)} auctions formed, "
-                    f"{excl} unattributed ({100 * excl / found:.0f}% of field excluded)")
+                    f"{excl} excluded ({100 * excl / found:.0f}% of field; reasons in "
+                    f"the coverage block)")
+            clamped = (st.get("agg") or {}).get("validto_clamped_auctions", 0)
+            if clamped:
+                chk(False, True, "bodies unmodified",
+                    f"--clamp-validto extended expired validTo on {clamped} auction(s) "
+                    f"({(st.get('agg') or {}).get('validto_clamped_orders', 0)} orders); "
+                    f"replay bodies differ from the archived auctions")
         verdict = ("READY" if all(c["level"] == "ok" for c in checks)
                    else "NOT READY" if any(c["level"] == "fail" for c in checks)
                    else "REVIEW")
@@ -1088,10 +1267,13 @@ def readiness_report(st, args):
             "past_deadline": s["late"], "solve_timeout_s": args.solve_timeout,
             "implausible": s["implausible"], "checks": checks,
             "errors": dict(s["errors"]),
+            "unscanned_blocks": unscanned,
+            "skipped": dict(st.get("skip") or {}),
+            "validto_clamped_auctions": clamped,
         }
         reports.append(rep)
-        if args.quiet:
-            continue
+        # --quiet silences PROGRESS (stderr), never the verdict: a CI gate
+        # redirecting stdout must still get the screen (v0.10.0).
         mark = {"ok": "PASS", "warn": "WARN", "fail": "FAIL"}
         print()
         print("=" * 68)
@@ -1117,10 +1299,9 @@ def readiness_report(st, args):
         blk = f"--from-block {st['from_block']} --to-block {st['to_block']}"
         print(f"    cow-backtester --chain {args.chain} --env {args.env} {blk} \\")
         print(f"        --rpc-url <rpc> --solver-url {sv['url']} --solver-name {sv['name']} --readiness")
-    if not args.quiet:
-        print()
-        print("  Note: replays live liquidity against archived auctions — a readiness")
-        print("  signal, not a settlement guarantee. Pair with self-hosted shadow before prod.")
+    print()
+    print("  Note: replays live liquidity against archived auctions — a readiness")
+    print("  signal, not a settlement guarantee. Pair with self-hosted shadow before prod.")
     return reports
 
 
@@ -1146,6 +1327,15 @@ def print_scorecard(st, args, cache, solver_names_map=None):
     if st["failed_ranges"]:
         print(f"  ⚠ unscanned block span : "
               f"{sum(hi - lo + 1 for lo, hi in st['failed_ranges'])} blocks (RPC getLogs failures)")
+    if a.get("competition_fetched") or a.get("competition_missing"):
+        print(f"  competition records   : {a['competition_fetched']} fetched / "
+              f"{a['competition_missing']} missing (404 = winnerless or evicted; "
+              f"transient failures are not distinguished by the API)")
+    if a.get("archive_error"):
+        print(f"  ⚠ archive writes failed: {a['archive_error']} (see stderr)")
+    if a.get("validto_clamped_auctions"):
+        print(f"  ⚠ bodies modified      : --clamp-validto extended validTo on "
+              f"{a['validto_clamped_auctions']} auction(s) / {a['validto_clamped_orders']} order(s)")
     if st["ages"]:
         ages = st["ages"]
         print(f"  auction age (hours)   : min {min(ages):.1f} / median {statistics.median(ages):.1f} / max {max(ages):.1f}")
@@ -1203,9 +1393,9 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         print(f"  valid solutions     : {s['valid']}/{s['replayed']}")
         print(f"  positive surplus    : {s['positive']}/{s['replayed']}")
         print(f"  beat the winning set: {s['beat']}/{s['replayed']}")
-        print(f"  our surplus (sum)   : {s['our_surplus'] / 1e18:.6f} {nat}")
+        print(f"  our surplus (sum)   : {_fmt_native(s['our_surplus'])} {nat}")
         wsa = s.get("winner_surplus_attempted") or s["winner_surplus"]
-        print(f"  winners (attempted) : {wsa / 1e18:.6f} {nat}  (all auctions sent, "
+        print(f"  winners (attempted) : {_fmt_native(wsa)} {nat}  (all auctions sent, "
               f"errors count as zero for us)")
         cap_adj = _pct(s["our_surplus"], wsa)
         cap_cond = _pct(s["our_surplus"], s["winner_surplus"])
@@ -1216,12 +1406,12 @@ def print_scorecard(st, args, cache, solver_names_map=None):
             print(f"  capture (answered)  : {cap_cond:.1f}%  (only auctions we "
                   f"responded to — diagnostic)")
         if s.get("lost_to_errors"):
-            print(f"  lost to errors      : {s['lost_to_errors'] / 1e18:.6f} {nat} "
+            print(f"  lost to errors      : {_fmt_native(s['lost_to_errors'])} {nat} "
                   f"of winner surplus on auctions where we errored/timed out")
         cape = _pct(s.get("our_surplus_exact", 0), s.get("winner_surplus_exact", 0))
         if cape is not None:
-            print(f"  capture (exact-basis): {cape:.1f}%  (direct settlements only — "
-                  f"same scoring basis both sides)")
+            print(f"  capture (exact-basis): {cape:.1f}%  (direct settlements only, all "
+                  f"attempted — same scoring basis both sides)")
         econ = economics.aggregate_report(
             s.get("econ_rows") or [], sv["name"],
             budget_cow=getattr(args, "consistency_budget", None),
@@ -1245,10 +1435,13 @@ def print_scorecard(st, args, cache, solver_names_map=None):
                 print(f"    field {e['solver'][:10]}  metric {e['metric']}")
         ft = competition.field_table(s.get("rank_rows") or [])
         if ft:
-            print(f"  field rank (proxy)  : rank1 {ft['rank1_pct']}% / top3 "
-                  f"{ft['top3_pct']}% of {ft['auctions_ranked']} ranked auctions, "
-                  f"median rank {ft['median_rank']}, median gap to winner "
-                  f"{ft['median_gap_bps']} bps")
+            elig = s.get("rank_eligible") or (ft["auctions_ranked"] + s.get("rank_no_bid", 0))
+            print(f"  field rank          : rank1 {ft['rank1_pct']}% / top3 "
+                  f"{ft['top3_pct']}% of {ft['auctions_ranked']} ranked auctions "
+                  f"({s.get('rank_no_bid', 0)} answered with no valid bid; "
+                  f"{elig} answered with a record), median rank {ft['median_rank']}, "
+                  f"median gap to winner {ft['median_gap_bps']} bps  "
+                  f"[best single solution vs field scores]")
             for rv in ft["rivals"][:3]:
                 print(f"    rival {rv['solver'][:10]}  wins={rv['wins']}  "
                       f"median gap {rv['median_gap_bps']} bps")
@@ -1265,6 +1458,26 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         if s["implausible"]:
             print(f"  ⚠ {s['implausible']} auction(s) flagged implausible_surplus — prices are CLAIMED,")
             print("    not simulated; treat those rows as suspect.")
+
+    # field consistency leaderboard — purely historical, needs no solver
+    if getattr(args, "reward_ev", False):
+        lb = economics.field_leaderboard(st.get("field_econ") or [],
+                                         self_address=getattr(args, "self_address", None))
+        print()
+        print("=" * 68)
+        print("  FIELD CONSISTENCY (CIP-85 v2 metric, historical, score basis)")
+        print("=" * 68)
+        if not lb:
+            print("  no competition records in this window (all 404/missing) — nothing to rank")
+        else:
+            print(f"  {lb['auctions']} auctions with a record; metric = Σ per-order share of "
+                  f"the executed-order surplus pool")
+            for e in lb["leaderboard"]:
+                print(f"  {e['solver'][:44]:>44} {e['metric']:>10.4f} {e['share_pct']:>7.2f}%")
+            if "historical_self_metric" in lb:
+                print(f"  your historical metric: {lb['historical_self_metric']} "
+                      f"({lb.get('historical_self_share_pct')}% of the pool)")
+            print(f"  ({lb['basis']})")
 
     # head-to-head
     h2h = None
@@ -1283,9 +1496,15 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         line("returned", s1["returned"], s2["returned"])
         line("valid", s1["valid"], s2["valid"])
         line("beat winning set", s1["beat"], s2["beat"])
-        line(f"surplus ({nat})", f"{s1['our_surplus'] / 1e18:.6f}", f"{s2['our_surplus'] / 1e18:.6f}")
-        c1, c2 = _pct(s1["our_surplus"], s1["winner_surplus"]), _pct(s2["our_surplus"], s2["winner_surplus"])
-        line("capture %", "n/a" if c1 is None else f"{c1:.1f}", "n/a" if c2 is None else f"{c2:.1f}")
+        line(f"surplus ({nat})", _fmt_native(s1["our_surplus"]), _fmt_native(s2["our_surplus"]))
+        # coverage-adjusted (attempted) denominators, like the headline — the
+        # answered-only ratio let a solver that failed half the field tie one
+        # that answered everything (v0.10.0)
+        w1 = s1.get("winner_surplus_attempted") or s1["winner_surplus"]
+        w2 = s2.get("winner_surplus_attempted") or s2["winner_surplus"]
+        c1, c2 = _pct(s1["our_surplus"], w1), _pct(s2["our_surplus"], w2)
+        line("capture % (adjusted)", "n/a" if c1 is None else f"{c1:.1f}", "n/a" if c2 is None else f"{c2:.1f}")
+        line("errored", s1["errored"], s2["errored"])
         if s1["latency"] and s2["latency"]:
             line("latency p50 ms", sorted(s1["latency"])[len(s1["latency"]) // 2],
                  sorted(s2["latency"])[len(s2["latency"]) // 2])
@@ -1301,7 +1520,8 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         print(f"  {'per-auction wins':>22} : {wins[n1]:>18} {wins[n2]:>18}   (ties {wins['tie']})")
         h2h_rows.append(("per-auction wins", [wins[n1], wins[n2]]))
         delta = s1["our_surplus"] - s2["our_surplus"]
-        print(f"  → {n1} minus {n2}: {delta / 1e18:+.6f} {nat}")
+        sign = "+" if delta > 0 else ""
+        print(f"  → {n1} minus {n2}: {sign}{_fmt_native(delta)} {nat} ({delta:+d} wei)")
         h2h = {"names": [n1, n2], "rows": h2h_rows}
 
     # pair breakdown
@@ -1363,6 +1583,13 @@ def build_summary(st, args, extra, solver_names_map=None):
         cov[f"skipped: {k}"] = v
     if st["failed_ranges"]:
         cov["unscanned blocks"] = sum(hi - lo + 1 for lo, hi in st["failed_ranges"])
+    a = st.get("agg") or {}
+    if a.get("competition_fetched") or a.get("competition_missing"):
+        cov["competition records fetched/missing"] = (
+            f"{a.get('competition_fetched', 0)}/{a.get('competition_missing', 0)}")
+    if a.get("validto_clamped_auctions"):
+        cov["bodies modified by --clamp-validto (auctions/orders)"] = (
+            f"{a['validto_clamped_auctions']}/{a['validto_clamped_orders']}")
     if st["ages"]:
         cov["auction age median (h)"] = round(statistics.median(st["ages"]), 1)
     if st["api_check"]:
@@ -1379,6 +1606,9 @@ def build_summary(st, args, extra, solver_names_map=None):
                     for _, _, lb in SIZE_BUCKETS + [(0, 0, "unknown")]
                     if st["field_by_bucket"].get(lb, [0, 0])[0]],
         "solvers": solvers, "solver_names": [s["name"] for s in args.solvers],
+        "field_consistency": (economics.field_leaderboard(
+            st.get("field_econ") or [], self_address=getattr(args, "self_address", None))
+            if getattr(args, "reward_ev", False) else None),
         "head_to_head": extra.get("head_to_head"), "pairs": extra.get("pairs"),
         "readiness": extra.get("readiness"),
         "submitters": [{"address": a, "name": (solver_names_map or {}).get(a),
@@ -1396,9 +1626,10 @@ def main():
         prog="cow-backtester",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="CoW historical-auction backtester + counterfactual scorecard",
-        epilog="Exit codes: 0 success, 1 runtime error, 2 usage error, 130 interrupted "
-               "(partial scorecard printed). Self-tests: python3 -m cow_backtester.scorer "
-               "--unittest (offline) / --selftest, python3 -m cow_backtester --selftest (network).")
+        epilog="Exit codes: 0 success, 1 runtime error, 2 usage error, 4 --fail-on gate tripped, "
+               "130 interrupted (partial scorecard printed). Self-tests: python3 -m "
+               "cow_backtester.scorer --unittest (offline) / --selftest, "
+               "python3 -m cow_backtester --selftest (network).")
     ap.add_argument("--chain", default="arbitrum-one", choices=sorted(CHAINS),
                     help="chain to scan (make this explicit in scripts)")
     ap.add_argument("--env", default="prod", choices=["prod", "staging"],
@@ -1430,6 +1661,9 @@ def main():
     ap.add_argument("--min-evidence", type=int, default=10,
                     help="minimum attempted auctions before --readiness may say "
                          "READY (below it the best verdict is REVIEW)")
+    ap.add_argument("--fail-on", choices=["not-ready", "review"], default=None,
+                    help="with --readiness: exit 4 when any endpoint's verdict is "
+                         "NOT READY (not-ready) or REVIEW-or-worse (review) — a CI gate")
     ap.add_argument("--compete", action="store_true",
                     help="fetch each auction's historical competition record "
                          "(v2 API) and rank the challenger against the "
@@ -1588,7 +1822,12 @@ def main():
                 "from_block": st["from_block"], "to_block": st["to_block"],
                 "settlement_txs_found": len(st["txs"]),
                 "auctions_formed": st["n_found"], "rows": len(st["rows"]),
-                "skipped": dict(st["skip"]), "caveats": CAVEATS}}) + "\n")
+                "skipped": dict(st["skip"]),
+                "failed_ranges": [list(r) for r in st["failed_ranges"]],
+                "unscanned_blocks": sum(hi - lo + 1 for lo, hi in st["failed_ranges"]),
+                "competition_missing": st["agg"].get("competition_missing", 0),
+                "validto_clamped_auctions": st["agg"].get("validto_clamped_auctions", 0),
+                "caveats": CAVEATS}}) + "\n")
             jout.flush()
             say(f"  wrote {len(st['rows'])} rows + 1 _meta line -> {args.json_out}")
 
@@ -1607,6 +1846,10 @@ def main():
         jout.close()
     if was_interrupted:
         sys.exit(130)
+    if args.readiness and args.solvers and gate_failed([r["verdict"] for r in readiness],
+                                                        getattr(args, "fail_on", None)):
+        print(f"readiness gate --fail-on {args.fail_on}: tripped", file=sys.stderr)
+        sys.exit(4)
 
 
 def cli():
@@ -1630,7 +1873,31 @@ def selftest():
     dec = scorer.decode_settlement(s["calldata"])
     ev = scorer.trade_events(s["logs"])
     body = s3_auction("prod", "arbitrum-one", dec["auction_id"])
-    assert body, "S3 body missing"
+    if not body:
+        # The S3 bucket keeps ~1 month; the pinned auction ages out of it.
+        # Every invariant below is generic, so pick a recent direct settle()
+        # whose body is still served instead of failing on data expiry.
+        print("pinned auction left the S3 retention window; picking a recent settlement",
+              file=sys.stderr)
+        head = int(scorer.rpc(rpcs, "eth_blockNumber", []), 16)
+        recent, _failed = enumerate_settlements(rpcs, head - 3000, head)
+        s = dec = ev = body = None
+        for cand in reversed(recent):
+            cs = scorer.fetch_settlement(rpcs, cand)
+            if not cs or cs["status"] != "0x1" or cs["calldata"][:10].lower() != scorer.SETTLE_SELECTOR:
+                continue
+            try:
+                cdec = scorer.decode_settlement(cs["calldata"])
+            except Exception:
+                continue
+            cev = scorer.trade_events(cs["logs"])
+            if cdec["auction_id"] is None or len(cev) != len(cdec["trades"]) or not cev:
+                continue
+            cbody = s3_auction("prod", "arbitrum-one", cdec["auction_id"])
+            if cbody:
+                s, dec, ev, body, tx = cs, cdec, cev, cbody, cand
+                break
+        assert body, "no recent settlement with an S3 body found — is the bucket reachable?"
     refp = {k.lower(): int(v["referencePrice"]) for k, v in body["tokens"].items()
             if v.get("referencePrice") is not None}
     w = scorer.winner_settlement_surplus(dec, ev, body, refp)

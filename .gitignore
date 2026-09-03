@@ -9,3 +9,7 @@ dist/
 .ruff_cache/
 .venv/
 venv/
+# artifacts the README tells users to create in a checkout (HTML embeds solver URLs)
+*.html
+competition-data/
+*.json.gz
