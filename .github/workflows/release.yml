@@ -1,0 +1,46 @@
+name: Release to PyPI
+
+# Publishes the tagged version to PyPI via Trusted Publishing (OIDC): no API
+# token is stored anywhere. One-time setup on PyPI: project → Publishing →
+# add a GitHub publisher with owner KaiserSolver, this repository, workflow
+# `release.yml`, environment `pypi`. Then every `v*` tag push publishes; the
+# manual trigger publishes whatever the chosen ref builds (use it once to
+# publish a tag that was pushed before this workflow existed).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # the OIDC token PyPI verifies
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
