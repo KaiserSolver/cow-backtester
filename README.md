@@ -50,9 +50,9 @@ API (`POST /solve`).
 
 If you are bringing up a new solver and want a fast "is this endpoint healthy
 enough to face production auctions?" read, `--readiness` prints a one-screen
-report instead of the full field scorecard. We hold ourselves to it: a real
-report for our own Base solver, warnings included, is committed at
-[`docs/readiness/kaisersolver-base-2026-08-22.md`](docs/readiness/kaisersolver-base-2026-08-22.md).
+report instead of the full field scorecard. We hold ourselves to it: our own
+Base solver's report is committed under `docs/readiness/` (the 2026-08-22 one is
+kept there, marked superseded by the 0.11.0 method).
 
 ```bash
 cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc> \
@@ -63,25 +63,49 @@ It replays recent auctions against your endpoint and reports up to eleven
 checks across four dimensions — does it answer, is it fast enough, are its
 solutions valid, are they competitive with the on-chain winners — plus how
 complete the field it was measured against actually was, as pass/warn checks
-with a `READY` / `REVIEW` / `NOT READY` verdict (real output, our own solver):
+with a `READY` / `REVIEW` / `NOT READY` verdict. Real output, our own Base solver,
+a 300-block run on 2026-09-14 with 0.11.0 (RPC redacted, nothing else):
 
 ```
 ====================================================================
   READINESS — kaisersolver   [REVIEW]
-  base · prod · blocks 50314011..50316011
+  base · prod · blocks 51302436..51302735
 ====================================================================
-  [PASS] reached auctions         25 auctions attempted
-  [PASS] no transport errors      0 errors
-  [PASS] answers reliably         100% returned a parseable response (incl. legitimate empty solutions)
-  [PASS] bid coverage             64% of answered auctions carried >=1 solution
-  [PASS] inside the deadline      0 past deadline
-  [PASS] latency headroom         p95 1548 ms of a 20000 ms budget
-  [PASS] solutions are valid      100% of bid auctions had >=1 valid solution
-  [WARN] competitive vs winners   43% of winner surplus captured (coverage-adjusted; 43% conditional on answering)
-  [WARN] prices look plausible    1 auction(s) flagged implausible_surplus
+  window  : blocks 51302436..51302735 | attempted auctions span 2026-09-14T13:57:09Z → 2026-09-14T14:06:25Z (0.15 h, settlement-block timestamps; 187.77 attempted/h)
+            settlements found 32 / auctions formed 29 / attempted 29 / replayed 29 / returned 7
+            excluded 0
+  budget  : 4.620 s (observed, BUDGETS_S[base].settle) | original-deadline upper bound n/a (needs --compete)
+  thresholds: profile 'default' — answer_rate >=90/50% · transport 0/<=1% · deadline_miss 0/<=1% · latency p95 <=0.5x/1x budget · validity >=90/50% · capture >=50/>0% · min_evidence 500
+  INSUFFICIENT SAMPLE (attempted 29 < 500)
+  [PASS] reached auctions         29 auctions attempted
+  [PASS] no transport errors      0 transport errors
+  [PASS] answers reliably         100% returned a parseable response inside the budget (incl. legitimate empty solutions)
+  [WARN] bid coverage             24% of answered auctions carried >=1 solution
+  [PASS] inside the deadline      0 deadline misses
+  [PASS] latency headroom         p95 1107 ms of a 4620 ms budget (observed); PASS <= 0.5x, WARN <= 1x
+  [PASS] solutions are valid      100% of bid auctions had >=1 valid solution [feasibility+eligibility+udcp+fairness:not-evaluated; fairness_filtered 0, zero_surplus 0, udcp 25 checked / 0 violations]
+  [PASS] competitive vs winners   91% of winner surplus captured (coverage-adjusted; 91% conditional on answering; basis mix {'exact_uniform': 23, 'wrapper_lower_bound': 6})
   [PASS] scan coverage            every block in the window was scanned
-  [PASS] field coverage           75 settlements, 71 auctions formed, 0 excluded (0% of field; reasons in the coverage block)
+  [PASS] field coverage           32 settlements, 29 auctions formed, 0 excluded (0% of field; top reasons [])
+  ----------------------------------------------------------------
+  answered            : 29/29  (100%)   bids: 7   transport: 0   deadline misses: 0
+  latency             : p50 348 ms / p95 1107 ms / max 1460 ms   (budget 4620 ms; answered-only incl. late answers)
+  surplus vs winners  : 91% captured (coverage-adjusted) / 91% conditional   (7/29 valid)
+  winner basis mix    : {'exact_uniform': 23, 'wrapper_lower_bound': 6}
+  validity basis      : feasibility+eligibility+udcp+fairness:not-evaluated
+
+  Reproduce this run:
+    cow-backtester --chain base --env prod --from-block 51302436 --to-block 51302735 --bodies-dir <bodies-dir: rerun with --archive-bodies DIR to make this reproducible> --solve-timeout 4.62 --min-evidence 500 \
+        --rpc-url <rpc> --solver-url http://127.0.0.1:11090/prod/base --solver-name kaisersolver --readiness
+    # cow-backtester 0.11.0 · engine build sha: <fill in: the endpoint's boot-line git_sha (not exposed over /solve)>
+
+  Note: replays live liquidity against archived auctions — a readiness
+  signal, not a settlement guarantee. Pair with self-hosted shadow before prod.
 ```
+
+Twenty-nine auctions is a smoke test, not evidence: the verdict is held at REVIEW by the
+500-auction floor no matter how the checks read, and the header says so. The full-window
+report, run to the floor, follows in `docs/readiness/`.
 
 It prints the exact `--from-block/--to-block` command to reproduce the run,
 and the same data lands in `--json-out`/`--html-out` under `readiness`

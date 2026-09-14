@@ -1,9 +1,10 @@
-> **SUPERSEDED (2026-09-14).** This report was produced by cow-backtester 0.10.0: it
-> measured latency against the tool's pre-0.11 assumed 20 s budget (the real Base
-> settle-lane budget is ≈4.6 s, see `readiness-inputs-report.md` G.1) and on a
-> 25-auction `--max-auctions` cap (a 23-minute slice of a 67-minute window). Under
-> 0.11.0 that sample would be held at REVIEW and the latency headroom read differently.
-> It is kept as a historical record and has not been regenerated here.
+> **SUPERSEDED (2026-09-14).** This report was produced by cow-backtester 0.10.0. It measured
+> latency against the tool's then-assumed 20 s per-request budget (the observed Base settle-lane
+> budget is ≈4.6 s) and on a 25-auction `--max-auctions` sample — a 23-minute slice of a
+> 67-minute window. The 0.11.0 method replaces both: the budget comes from a per-chain observed
+> table and a capped or sub-500-auction sample is held at REVIEW. See the
+> [0.11.0 CHANGELOG entry](../../CHANGELOG.md#0110--2026-09-14). This file is kept as a historical
+> record and has not been regenerated.
 
 # Readiness report: kaisersolver on Base — 2026-08-22
 
