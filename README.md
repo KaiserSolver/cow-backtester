@@ -278,10 +278,10 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--env` | `prod` (default) or `staging` |
 | `--blocks N` | scan the most recent N blocks |
 | `--from-block/--to-block` | absolute, reproducible window |
-| `--max-auctions N` | cap auctions scored, newest first (default 25; 0 = all) |
+| `--max-auctions N` | cap auctions scored, newest first (default 0 = all; a cap holds `--readiness` at REVIEW) |
 | `--rpc-url` | your RPC (recommended — public defaults rot and rate-limit) |
 | `--solver-url` / `--solver-name` | repeatable; two of them = A/B |
-| `--solve-timeout S` | deadline advertised to the solver (HTTP waits S+5) |
+| `--solve-timeout S` | OVERRIDE the per-request budget advertised to the solver, seconds (HTTP waits S+5). Default: the observed driver budget for the chain (`BUDGETS_S`); `--readiness` refuses to run on a chain with no observed value unless given |
 | `--workers N` | concurrent RPC/S3 fetches (default 8) |
 | `--cache-dir` / `--no-cache` | content cache (default `.cowbt-cache`) |
 | `--json-out` / `--html-out` | machine-readable rows / HTML report |
@@ -293,7 +293,9 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--reward-ev` | CIP-85 v2 consistency economics: counterfactual metric, field leaderboard, COW estimate (implies `--compete`) |
 | `--consistency-budget N` | the chain's weekly consistency pool in COW, to convert share → COW/week |
 | `--readiness` | one-screen pre-prod verdict for the endpoint(s) instead of the field scorecard |
-| `--min-evidence N` | attempted-auction floor before `--readiness` may say READY (default 10) |
+| `--min-evidence N` | OVERRIDE the attempted-auction floor before `--readiness` may say READY (table default 500) |
+| `--archive-bodies DIR` | store every auction body used as `DIR/<chain>/<id>.json.gz` + `manifest.jsonl` so the run survives S3 eviction |
+| `--bodies-dir DIR` | replay from a `--archive-bodies` archive; a missing body is `body_not_archived`, never an S3 fallback |
 | `--fail-on not-ready\|review` | with `--readiness`: exit 4 when a verdict trips — a CI gate |
 | `--clamp-validto` | extend expired `validTo` so engines that filter them still solve |
 | `--max-age-hours H` | warn when replayed auctions are older than this |

@@ -1,3 +1,10 @@
+> **SUPERSEDED (2026-09-14).** This report was produced by cow-backtester 0.10.0: it
+> measured latency against the tool's pre-0.11 assumed 20 s budget (the real Base
+> settle-lane budget is ≈4.6 s, see `readiness-inputs-report.md` G.1) and on a
+> 25-auction `--max-auctions` cap (a 23-minute slice of a 67-minute window). Under
+> 0.11.0 that sample would be held at REVIEW and the latency headroom read differently.
+> It is kept as a historical record and has not been regenerated here.
+
 # Readiness report: kaisersolver on Base — 2026-08-22
 
 The Readiness Standard, applied to ourselves. This is `cow-backtester --readiness`

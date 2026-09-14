@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.11.0 — 2026-09-14
+
+Readiness-standard batch. The 2026-09-14 audit (`readiness-inputs-report.md`)
+found that `--readiness` measured against a budget nobody observed, on a
+sample nobody could reproduce, with a validity that was not the protocol's.
+This release makes the tool measure what a public specification can say it
+measures. Every numeric choice now lives in a table, never in a literal.
+
+- **The budget is the driver's, not a 20 s constant.** The replay used to
+  overwrite the archived `deadline` with `now + --solve-timeout` (default
+  20 s) on every chain; the real settle-lane budget is 4.6–4.9 s (audit
+  G.1). `BUDGETS_S` carries the observed per-chain values (Arbitrum 4.84,
+  Base 4.62, BNB 2.35); `--solve-timeout` is now an optional OVERRIDE
+  (float, > 0), and `--readiness` on a chain with no observed budget and no
+  override exits 2 before any network call — an `assumed` budget must never
+  produce a verdict (plain replays fall back to `ASSUMED_BUDGET_S`, labeled).
+  Rows keep the archived value as `original_deadline`; with `--compete`
+  they also carry `original_budget_upper_s` (deadline minus the
+  auction-start-block timestamp — an upper bound on the true budget, and
+  labeled so) and the readiness header prints its p50/p95. The header,
+  JSON and `_meta` line carry `budget_s` and `budget_source`
+  (`observed` | `override` | `assumed`).
+- **A capped or thin sample cannot be READY.** `--max-auctions` defaults
+  to 0 (no cap); any cap adds a `sample capped` WARN and the header says
+  `SAMPLE CAPPED (--max-auctions N)`. `min_evidence` moves into the
+  threshold table at 500 attempted auctions (`--min-evidence` overrides);
+  below it the header says `INSUFFICIENT SAMPLE (attempted N < 500)`. The
+  header now prints the window three ways — block range, wall-clock span
+  of the attempted auctions (auction-start timestamps under `--compete`,
+  settlement timestamps otherwise), and `settlements found / auctions
+  formed / attempted / replayed / returned` — plus `excluded` with the top
+  three reasons; JSON adds `window`, `counts`, `excluded` and
+  `auctions_per_hour`.
+- **Deadline misses mirror the driver.** `errored`/`late` are gone. A
+  socket `timeout` is a deadline miss (the driver got nothing in time), and
+  so is an answer that lands after the budget (`late` — the driver would
+  have discarded it; it still counts in the answered-only latency sample so
+  it cannot flatter p95). Everything else is `transport`. The per-reason
+  dict is keyed by the driver's labels — `DeadlineExceeded`,
+  `SolverHttpError`, `SolverDeserializeError`, `SolverDtoError` — with the
+  fine-grained reason underneath. Checks: deadline misses and transport
+  errors each PASS at 0, WARN at ≤ 1% of attempted, FAIL above (the old
+  `late*5 <= attempted` / `errored < attempted` rules are gone). Rows carry
+  `outcome` and `driver_result`.
+- **Validity is the protocol's three-part definition.** (i) eligibility is
+  unchanged, with `valid_zero_surplus` counting fills at the limit;
+  (ii) UDCP is a named structural check (`udcp_checked` / `udcp_violation`
+  when a token is priced twice under two spellings); (iii) CIP-67 fairness
+  is applied to the CHALLENGER when a competition record is available:
+  `competition.pair_baselines` re-derives the autopilot rule (best
+  single-pair solution per directed pair; a multi-pair solution is filtered
+  when any pair scores below its baseline; the challenger's own single-pair
+  solutions raise the baselines as they would in the real auction).
+  Filtered solutions count in `fairness_filtered`, leave `n_valid` and the
+  capture numerator, and `validity_basis` says
+  `feasibility+eligibility+udcp+fairness` or `…+fairness:not-evaluated`.
+- **Thresholds live in `THRESHOLDS`** (`default` plus per-chain overrides;
+  v0 ships `default` only). The header prints the profile and every value
+  applied, `(override: …)` marks CLI overrides, and the JSON carries the
+  resolved dict with a per-key source.
+- **Capture: disclosure, not a new formula.** The basis mix
+  (`exact_uniform` / `wrapper_lower_bound` / `mixed` among attempted
+  auctions) is printed and in the JSON next to `capture_pct` and
+  `capture_conditional_pct`; the record's `referenceScore` is copied to the
+  row as `winner_reference_score` for the reader (no check uses it).
+- **Runs are reproducible after the bucket evicts the bodies.**
+  `--archive-bodies DIR` stores every body used as
+  `DIR/<chain>/<id>.json.gz` (canonical JSON, digested before the replay
+  touches it) plus `manifest.jsonl`; `--bodies-dir DIR` replays from the
+  archive and skips a missing body as `body_not_archived`, never falling
+  back to S3. Every row carries `body_sha256`. The `Reproduce this run`
+  line is a complete command (`--bodies-dir`, the resolved
+  `--solve-timeout`, `--min-evidence`, any cap) with the tool version and a
+  placeholder for the engine build sha the operator must fill in.
+
+Also:
+
+- `competition.py` no longer advertises the deprecated per-solution
+  `clearingPrices` field (empty on recent autopilots; never read).
+- `docs/readiness/kaisersolver-base-2026-08-22.md` is marked superseded
+  (measured against the pre-0.11 20 s budget and a 25-auction cap).
+- `build_parser()` / `main(argv)` for offline CLI tests; the HTML report's
+  counterfactual table shows `failed` (transport + deadline misses).
+
 ## 0.10.0 — 2026-09-03
 
 Metric-correctness batch from a six-lane review (scoring and CIP-85
