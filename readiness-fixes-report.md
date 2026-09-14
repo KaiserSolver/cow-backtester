@@ -1,6 +1,6 @@
 # Readiness-standard fixes — backtester half (T1–T8)
 
-**Repo:** `/root/cow-backtester`, branch `readiness-v0.11` from `72ffbde` (v0.10.0 + 2 CI commits). **Not pushed.**
+**Branch:** `readiness-v0.11` from `72ffbde` (v0.10.0 + 2 CI commits); released as v0.11.0.
 **Date:** 2026-09-14. **Audit referenced:** `readiness-inputs-report.md` (this repo, untracked), sections B, C, D, E, G.1, H.
 **Runtime dependency:** still `eth_abi` only (`pyproject.toml:12`); the new code uses `hashlib`, `gzip`, `json`, `re`, `datetime` from the standard library.
 
@@ -160,7 +160,7 @@ Legacy tests touched (semantics, not deleted): five readiness tests in `tests/te
 
 ## Not done / out of scope, stated
 
-- No tag, no PyPI release, no push (the release runbook is a separate, Kaiser-run step).
+- Tagging and the PyPI release are a separate step (see CHANGELOG 0.11.0).
 - `readiness-inputs-report.md` and `readiness_budget_distribution.py` from the 2026-09-14 audit remain untracked in this repo, as that brief required; they are not part of these commits.
 - The winner-surplus reconstruction (`scorer.py`), the disjoint combiner and the S3/RPC caches are untouched, per the brief.
 - The HTML report (`report.py`) shows `failed` (transport + deadline misses) in the counterfactual table; it does not yet render the new readiness header fields (window, budget, thresholds) beyond the checks table — the JSON carries them.
