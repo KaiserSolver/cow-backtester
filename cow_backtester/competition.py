@@ -3,11 +3,20 @@
 The v2 endpoint `/api/v2/solver_competition/{auction_id}` (probed 2026-08-17:
 serves records >= 2 months back, 404 for winnerless auctions) returns, per
 auction: every submitted solution with `solverAddress`, `score`, `ranking`,
-`isWinner`, `filteredOut` (CoW's OWN fairness-filtering outcome — no local
-CIP-67 re-implementation needed), per-solution `clearingPrices` and executed
-orders, per-solution `referenceScore`, the auction's native `prices`, and
+`isWinner`, `filteredOut` (CoW's OWN fairness-filtering outcome for the
+historical field), the solution's executed `orders` (id, sellAmount,
+buyAmount), per-solution `referenceScore`, the auction's native `prices`, and
 `auctionStartBlock` / `auctionDeadlineBlock` (the auction-cut context a
-settlement block cannot provide).
+settlement block cannot provide). The per-solution `clearingPrices` field is
+deprecated and EMPTY for auctions produced by recent autopilots; nothing in
+this package reads it (the only clearing prices used anywhere are decoded from
+on-chain settle() calldata, scorer.py).
+
+The historical field's fairness is CoW's flag. A replayed CHALLENGER has no
+flag, so `pair_baselines` re-derives the CIP-67 rule the autopilot applies
+(winner_selection: a solution trading more than one directed token pair is
+filtered when any of its pairs scores below the best single-pair solution on
+that pair) from the record, and backtest.validate_and_score applies it.
 
 Rank basis: the challenger is ranked by its best SINGLE solution on the
 tool's uniform-price basis, which agrees with the API's official `score` to
@@ -83,6 +92,59 @@ def _fair_scores(record):
             continue
     out.sort(key=lambda t: t[1], reverse=True)
     return out
+
+
+def pair_baselines(record, body, stats=None):
+    """CIP-67 per-directed-pair baselines from the historical field.
+
+    Mirrors autopilot `winner_selection::compute_baseline_scores`: for every
+    submitted solution whose orders all lie on ONE directed (sell, buy) pair,
+    the pair's baseline is the best such solution's `score` (CIP-38 score,
+    native wei — the basis a replayed challenger's uniform-price surplus
+    agrees with to within 0.2%). Multi-pair solutions never set a baseline;
+    `filteredOut` is irrelevant here because a single-pair solution cannot be
+    filtered by fairness. Solutions with a non-positive score are skipped as
+    the autopilot skips them.
+
+    Order → pair comes from the auction body's orders; a solution carrying an
+    order the body does not know (a JIT order, an unknown uid) cannot be
+    placed on a pair and is skipped, counted in stats["fairness_unmapped"].
+
+    Returns {(sell_token_lower, buy_token_lower): score_wei}, possibly empty
+    (empty still means "evaluated": the field simply set no baselines).
+    """
+    pair_of = {}
+    for o in body.get("orders") or []:
+        try:
+            pair_of[o["uid"].lower()] = (o["sellToken"].lower(), o["buyToken"].lower())
+        except (KeyError, AttributeError):
+            continue
+    baselines = {}
+    for s in record.get("solutions") or []:
+        try:
+            score = int(s.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if score <= 0:
+            continue
+        pairs = set()
+        unmapped = False
+        for o in s.get("orders") or []:
+            p = pair_of.get((o.get("id") or "").lower())
+            if p is None:
+                unmapped = True
+                break
+            pairs.add(p)
+        if unmapped:
+            if stats is not None:
+                stats["fairness_unmapped"] += 1
+            continue
+        if len(pairs) != 1:
+            continue
+        (p,) = tuple(pairs)
+        if score > baselines.get(p, 0):
+            baselines[p] = score
+    return baselines
 
 
 def rank_vs_field(record, our_score_wei, self_address=None):

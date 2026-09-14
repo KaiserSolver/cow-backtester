@@ -112,7 +112,7 @@ def render(summary, rows, path):
                 f"<td>{_eth(s['our_surplus'], nat)}</td>"
                 f"<td>{'n/a' if cap is None else f'{cap:.1f}%'}</td>"
                 f"<td>{s.get('p50_ms', '-')}</td><td>{s.get('p95_ms', '-')}</td>"
-                f"<td class='{'bad' if s['errored'] else ''}'>{s['errored']}</td>"
+                f"<td class='{'bad' if s.get('failed') else ''}'>{s.get('failed', 0)}</td>"
                 f"<td class='{'warn' if s.get('implausible') else ''}'>{s.get('implausible', 0)}</td></tr>")
         p.append("</table></div>")
         p.append('<p class="note">Indicative: replayed against <b>live</b> liquidity and scored '

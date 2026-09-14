@@ -185,18 +185,20 @@ def test_field_leaderboard_needs_no_challenger():
 # ------------------------------------------------------------- readiness
 
 class _Args:
-    def __init__(self, solvers, quiet=False, solve_timeout=15):
+    def __init__(self, solvers, quiet=False, solve_timeout=15, min_evidence=10):
         self.solvers = solvers
         self.chain, self.env = "base", "prod"
         self.solve_timeout = solve_timeout
         self.quiet = quiet
+        self.min_evidence = min_evidence     # v0.11.0: table floor is 500; pin the override
+        self.max_auctions = 0
 
 
 def _stat(**over):
-    base = {"replayed": 20, "errored": 0, "returned": 20, "valid": 20, "positive": 20,
-            "beat": 5, "our_surplus": 600, "winner_surplus": 1000, "implausible": 0,
+    base = {"replayed": 20, "transport": 0, "deadline_miss": 0, "returned": 20, "valid": 20,
+            "positive": 20, "beat": 5, "our_surplus": 600, "winner_surplus": 1000, "implausible": 0,
             "attempted": 20, "winner_surplus_attempted": 1000, "lost_to_errors": 0,
-            "invalid": Counter(), "errors": Counter(), "latency": [100] * 20, "late": 0}
+            "invalid": Counter(), "errors": Counter(), "latency": [100] * 20}
     base.update(over)
     return base
 

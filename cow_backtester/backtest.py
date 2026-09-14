@@ -40,6 +40,7 @@ Usage:
 
 import argparse
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -142,6 +143,68 @@ CAVEATS = [
     "scored on a DELIVERED basis (Trade events vs signed limits) which understates the direct "
     "before-fee basis by the fee wedge. Unresolvable ones are reported under wrapper_unattributed.",
 ]
+
+# ----------------------------------------------------------- readiness tables
+#
+# Every numeric choice the readiness verdict rests on lives in one of the
+# tables below (v0.11.0), never in a literal inside readiness_report(), so it
+# can be changed without a code edit and every run prints the values it used.
+
+# Observed per-request budget the driver actually gives a solver, seconds,
+# settle lane p50 from the 2026-09-14 engine-log audit (readiness-inputs-report
+# G.1: Arbitrum 4.838 s over 94,575 requests, Base 4.615 s over 60,191, BNB
+# 2.353 s over 138). None = not observed on that chain; --readiness then
+# refuses to run without an explicit --solve-timeout (an ASSUMED budget must
+# never produce a verdict). Quote-lane budgets (~2.8 s) are not replayed here.
+BUDGETS_S = {
+    "arbitrum-one": {"settle": 4.84},
+    "base":         {"settle": 4.62},
+    "bnb":          {"settle": 2.35},
+    "mainnet":      {"settle": None},
+    "xdai":         {"settle": None},
+    "polygon":      {"settle": None},
+    "avalanche":    {"settle": None},
+    "linea":        {"settle": None},
+    "ink":          {"settle": None},
+    "plasma":       {"settle": None},
+}
+# Budget a plain (non-readiness) replay falls back to on a chain with no
+# observed value and no override — labeled `assumed` everywhere it appears.
+ASSUMED_BUDGET_S = 20.0
+# Extra HTTP wait past the advertised budget so a slow solver is OBSERVED
+# (and counted as a deadline miss), not cut off by the client.
+HTTP_GRACE_S = 5.0
+
+# Verdict thresholds. `default` applies to every chain; a chain key holds only
+# the overrides for that chain (v0 ships none — the mechanism is exercised by
+# tests). Rates are percentages of attempted auctions unless named otherwise.
+THRESHOLDS = {
+    "default": {
+        "answer_rate_pass": 90.0, "answer_rate_warn": 50.0,   # replayed / attempted
+        "transport_warn": 1.0, "transport_fail": 1.0,         # PASS = 0; WARN <= warn%; FAIL > fail%
+        "deadline_miss_warn": 1.0, "deadline_miss_fail": 1.0,  # same shape
+        "latency_pass_frac": 0.5, "latency_warn_frac": 1.0,   # p95 as a fraction of the budget
+        "validity_pass": 90.0, "validity_warn": 50.0,         # valid / returned
+        "capture_pass": 50.0, "capture_warn": 0.0,            # PASS >= pass; WARN > warn
+        "bid_coverage_pass": 50.0,                            # returned / replayed (warn-only)
+        "field_coverage_excluded_max_frac": 0.05,             # excluded / settlements found
+        "min_evidence": 500,                                  # attempted auctions for READY
+    },
+}
+
+# Driver-side labels for the per-reason error dict (autopilot's
+# `solutions{solver,result}` vocabulary) so a reader can line the replay's
+# failures up with what the protocol would have recorded.
+DRIVER_ERROR_LABELS = {
+    "timeout": "DeadlineExceeded", "late": "DeadlineExceeded",
+    "bad_json": "SolverDeserializeError",
+    "bad_schema": "SolverDtoError", "bad_solver_response": "SolverDtoError",
+    # everything else (http_<code>, unreachable*, response_too_large): SolverHttpError
+}
+DRIVER_ERROR_DEFAULT = "SolverHttpError"
+# Which bucket a failure lands in: a deadline miss is the driver discarding an
+# answer it never got in time; everything else is transport.
+DEADLINE_MISS_REASONS = {"timeout", "late"}
 
 
 # ---------------------------------------------------------------- primitives
@@ -370,7 +433,7 @@ def solve(solver_url, auction_body, timeout):
     try:
         # Solver endpoints are user-supplied: cap the read so a runaway
         # endpoint returns a structured error, not memory exhaustion.
-        with urllib.request.urlopen(req, timeout=timeout + 5) as r:
+        with urllib.request.urlopen(req, timeout=timeout + HTTP_GRACE_S) as r:
             raw = r.read(_MAX_HTTP_BYTES + 1)
         if len(raw) > _MAX_HTTP_BYTES:
             return None, "response_too_large", int((time.monotonic() - t0) * 1000)
@@ -468,6 +531,153 @@ def gate_failed(verdicts, fail_on):
     return any(v in bad for v in verdicts)
 
 
+# ------------------------------------------------- readiness-standard helpers
+
+def resolve_budget(chain, solve_timeout=None, readiness=False, lane="settle"):
+    """The per-request budget the replay advertises, seconds, and where it
+    came from: `override` (--solve-timeout), `observed` (BUDGETS_S), or
+    `assumed` (ASSUMED_BUDGET_S). With `readiness=True` an assumed budget is
+    refused (SystemExit 2, usage error): a verdict measured against a budget
+    nobody observed is not a readiness number."""
+    if solve_timeout is not None:
+        return float(solve_timeout), "override"
+    observed = (BUDGETS_S.get(chain) or {}).get(lane)
+    if observed is not None:
+        return float(observed), "observed"
+    if readiness:
+        print(f"ERROR: no observed per-request budget for --chain {chain} ({lane} lane) in "
+              f"BUDGETS_S, and --readiness refuses to measure against an assumed one. "
+              f"Pass the driver's real budget explicitly, e.g. --solve-timeout 4.6 "
+              f"(seconds), or add an observed value to BUDGETS_S.", file=sys.stderr)
+        raise SystemExit(2)
+    return float(ASSUMED_BUDGET_S), "assumed"
+
+
+def resolve_thresholds(chain, min_evidence=None):
+    """Threshold profile for a chain: `default` with the chain's overrides
+    laid on top. Returns (values, profile_name, sources) where sources maps
+    each key to 'default' | '<chain>' | 'override' (CLI)."""
+    values = dict(THRESHOLDS["default"])
+    sources = {k: "default" for k in values}
+    profile = "default"
+    over = THRESHOLDS.get(chain)
+    if over:
+        profile = chain
+        for k, v in over.items():
+            values[k] = v
+            sources[k] = chain
+    if min_evidence is not None:
+        values["min_evidence"] = int(min_evidence)
+        sources["min_evidence"] = "override"
+    return values, profile, sources
+
+
+def classify_outcome(err, ms, budget_ms):
+    """Map one dispatch outcome to the driver's taxonomy.
+
+    Returns (bucket, reason) with bucket in {'answered', 'deadline_miss',
+    'transport'} and reason the fine-grained label (None for an answer in
+    time). A `timeout` is a deadline miss (the driver got nothing by the
+    deadline); an answer that arrives after the budget is ALSO a deadline miss
+    (`late` — the driver would have discarded it); every other error is
+    transport."""
+    if err is None:
+        if ms > budget_ms:
+            return "deadline_miss", "late"
+        return "answered", None
+    if err in DEADLINE_MISS_REASONS:
+        return "deadline_miss", err
+    return "transport", err
+
+
+def driver_error_label(reason):
+    return DRIVER_ERROR_LABELS.get(reason, DRIVER_ERROR_DEFAULT)
+
+
+def driver_error_table(errors):
+    """{driver_label: {fine_reason: n}} from a flat per-reason Counter."""
+    out = {}
+    for reason, n in (errors or {}).items():
+        out.setdefault(driver_error_label(reason), {})[reason] = n
+    return out
+
+
+def _percentile(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * q))]
+
+
+def body_sha256(body):
+    """Digest of the canonical JSON form of an auction body, computed BEFORE
+    the replay touches it (deadline stamp, --clamp-validto), so an archived
+    body and a re-fetched one hash identically."""
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def stamp_deadline(body, row, budget_s):
+    """Preserve the archived wire deadline, then advertise a fresh one of
+    exactly `budget_s` seconds. Returns the stamped ISO deadline."""
+    row["original_deadline"] = body.get("deadline")
+    body["deadline"] = (datetime.now(timezone.utc) + timedelta(seconds=budget_s)
+                        ).isoformat().replace("+00:00", "Z")
+    row["replay_deadline"] = body["deadline"]
+    return body["deadline"]
+
+
+def parse_iso_ts(s):
+    """Seconds since the epoch for an ISO-8601 UTC timestamp with any
+    sub-second precision (the driver emits nanoseconds); None if unparseable."""
+    if not isinstance(s, str):
+        return None
+    t = s.strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    m = re.match(r"^(.*T\d\d:\d\d:\d\d)(\.\d+)?([+-]\d\d:\d\d)$", t)
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    try:
+        dt = datetime.fromisoformat(base + tz)
+    except ValueError:
+        return None
+    return dt.timestamp() + (float("0" + frac) if frac else 0.0)
+
+
+def bodies_path(bodies_dir, chain, auction_id):
+    return os.path.join(bodies_dir, chain, f"{auction_id}.json.gz")
+
+
+def archive_body(bodies_dir, chain, auction_id, body, sha, frm, to):
+    """--archive-bodies: store one body as DIR/<chain>/<aid>.json.gz (canonical
+    JSON) and append a manifest line. Idempotent on the body file; the
+    manifest records every run that used it."""
+    path = bodies_path(bodies_dir, chain, auction_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(body, f, sort_keys=True, separators=(",", ":"))
+        os.replace(tmp, path)
+    with open(os.path.join(bodies_dir, "manifest.jsonl"), "a", encoding="utf-8") as mf:
+        mf.write(json.dumps({"auction_id": auction_id, "chain": chain, "sha256": sha,
+                             "from_block": frm, "to_block": to,
+                             "fetched_at": datetime.now(timezone.utc).isoformat()
+                             .replace("+00:00", "Z")}) + "\n")
+
+
+def load_archived_body(bodies_dir, chain, auction_id):
+    """--bodies-dir: the archived body, or None when it is not archived. There
+    is deliberately NO S3 fallback — a reproduction must fail loudly."""
+    path = bodies_path(bodies_dir, chain, auction_id)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
 def preflight(solver_url, timeout=10):
     """Fail-fast reachability probe. An HTTP response proves the endpoint is
     alive — EXCEPT 404/405 on POST /solve, which means the wrong path (the tool
@@ -503,7 +713,7 @@ class _Malformed(Exception):
     pass
 
 
-def validate_and_score(resp, body, ref_prices):
+def validate_and_score(resp, body, ref_prices, fairness_baseline=None):
     """Validate + score a solver response on the shared comparison basis.
 
     A solution is scored only if EVERY fulfillment trade is feasible: known
@@ -514,18 +724,40 @@ def validate_and_score(resp, body, ref_prices):
     still cover the gross-scaled limit, so a padded fee cannot manufacture
     surplus. Violations invalidate the SOLUTION (tallied), never score zero.
 
+    Validity is the protocol's three-part definition (v0.11.0):
+      (i)  eligibility — at least one scored fulfillment (a zero-surplus fill
+           still counts; tallied as `valid_zero_surplus` so the edge shows);
+      (ii) uniform directional clearing prices — one price per traded token
+           in the solution's `prices` map (`udcp_violation` when a token is
+           priced twice under different spellings; `udcp_checked` counts the
+           solutions the check ran on);
+      (iii) CIP-67 fairness — when `fairness_baseline` ({(sell, buy): wei},
+           the field's best single-pair score per directed pair, see
+           competition.pair_baselines) is given, a solution trading MORE than
+           one directed pair is filtered if any of its pairs scores below that
+           pair's baseline (single-pair solutions are never filtered; the
+           challenger's own single-pair solutions raise the baselines exactly
+           as they would in the real competition). Filtered solutions are
+           counted in `fairness_filtered`, dropped from `n_valid` and from the
+           capture numerator. Without a baseline `fairness` is
+           `not_evaluated` and nothing is filtered.
+
     Valid solutions are combined CIP-67 style: best-first, disjoint directed
     (sell,buy) pairs — a strong solver can win several slots of one auction.
     """
     out = {"best_surplus_wei": 0, "best_single_wei": 0, "n_solutions": 0,
            "n_valid": 0, "invalid": {}, "jit_ignored": 0, "no_refprice": 0,
-           "by_pair": {}, "by_order": {}}
+           "by_pair": {}, "by_order": {},
+           "valid_zero_surplus": 0, "udcp_checked": 0, "udcp_violations": 0,
+           "fairness_filtered": 0,
+           "fairness": "evaluated" if fairness_baseline is not None else "not_evaluated"}
     if not isinstance(resp, dict) or not isinstance(resp.get("solutions"), list):
         return out
     by_uid = {o["uid"].lower(): o for o in body.get("orders", [])}
     invalid = Counter()
     best_by_order = {}
     candidates = []          # (surplus_wei, frozenset(pairs), {pair: wei})
+    feasible = []            # (surplus_wei, frozenset(pairs), {pair: wei}, {uid: wei})
 
     for sol in resp["solutions"]:
         out["n_solutions"] += 1
@@ -541,6 +773,13 @@ def validate_and_score(resp, body, ref_prices):
             except ValueError:
                 invalid["bad_numeric"] += 1
                 continue
+            # (ii) UDCP, structural: the schema carries ONE prices map per
+            # solution, so a token can only be priced twice by appearing under
+            # two spellings. Named so the report can say how many were checked.
+            out["udcp_checked"] += 1
+            if len(prices) != len(prices_raw):
+                out["udcp_violations"] += 1
+                reasons.add("udcp_violation")
 
             fulfills = {}
             for tr in trades_raw:
@@ -629,17 +868,37 @@ def validate_and_score(resp, body, ref_prices):
                 continue
             if scored == 0:
                 continue
-            out["n_valid"] += 1
-            candidates.append((total, frozenset(pair_wei), dict(pair_wei)))
-            # best valid bid per order across this response's solutions — the
-            # CIP-85 v2 consistency metric is built from the solver's BEST
-            # fair bid on each executed order
-            for uid, wei in order_wei.items():
-                if wei > best_by_order.get(uid, -1):
-                    best_by_order[uid] = wei
+            if total == 0:
+                out["valid_zero_surplus"] += 1
+            feasible.append((total, frozenset(pair_wei), dict(pair_wei), order_wei))
         except (_Malformed, TypeError, AttributeError, KeyError):
             invalid["malformed"] += 1
             continue
+
+    # (iii) fairness, applied AFTER every feasible solution is known: the
+    # challenger's own single-pair solutions raise the baselines, exactly as
+    # they would in the real competition (winner_selection::compute_baseline_scores).
+    baseline = None
+    if fairness_baseline is not None:
+        baseline = dict(fairness_baseline)
+        for total, pairs, _pw, _ in feasible:
+            if len(pairs) == 1 and total > 0:
+                (p,) = tuple(pairs)
+                if total > baseline.get(p, 0):
+                    baseline[p] = total
+    for total, pairs, pw, order_wei in feasible:
+        if (baseline is not None and len(pairs) > 1
+                and any(p in baseline and pw[p] < baseline[p] for p in pairs)):
+            out["fairness_filtered"] += 1
+            continue
+        out["n_valid"] += 1
+        candidates.append((total, pairs, pw))
+        # best valid bid per order across this response's solutions — the
+        # CIP-85 v2 consistency metric is built from the solver's BEST
+        # fair bid on each executed order
+        for uid, wei in order_wei.items():
+            if wei > best_by_order.get(uid, -1):
+                best_by_order[uid] = wei
 
     out["by_order"] = {u: w for u, w in best_by_order.items()}
 
@@ -831,14 +1090,39 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
         say(f"      {n_found} auctions from {len(txs)} settlement txs")
 
     # prefetch bodies concurrently (immutable and cached, so cheap on re-runs)
-    say("[3/4] fetching auction bodies + winner baselines"
+    bodies_dir = getattr(args, "bodies_dir", None)
+    archive_bodies = getattr(args, "archive_bodies", None)
+    say("[3/4] " + ("loading archived auction bodies" if bodies_dir else "fetching auction bodies")
+          + " + winner baselines"
           + (f" + replaying {len(args.solvers)} solver(s)" if args.solvers else ""))
+    agg = Counter()
+
     def _fetch_body(a):
+        if bodies_dir:
+            # --bodies-dir: the archive is the ONLY source. A missing body is a
+            # visible skip, never a silent S3 fallback (reproducibility, v0.11.0).
+            b = load_archived_body(bodies_dir, args.chain, a)
+            return b, (None if b else "body_not_archived")
         errs = Counter()
         b = s3_auction(args.env, args.chain, a, cache, errors=errs)
         return b, (next(iter(errs)) if errs else None)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         bodies = dict(zip(aids, pool.map(_fetch_body, aids), strict=True))
+    # Digest every body BEFORE the replay mutates it (deadline stamp,
+    # --clamp-validto); archive on request.
+    body_shas = {}
+    for a, (b, _err) in bodies.items():
+        if not b:
+            continue
+        body_shas[a] = body_sha256(b)
+        if archive_bodies:
+            try:
+                archive_body(archive_bodies, args.chain, a, b, body_shas[a], frm, to)
+                agg["bodies_archived"] += 1
+            except OSError as e:
+                agg["archive_error"] += 1
+                if agg["archive_error"] == 1:
+                    say(f"      ⚠ --archive-bodies write failed: {e}")
 
     rows = []
     field_by_bucket = defaultdict(lambda: [0, 0])
@@ -846,11 +1130,10 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                                       "solvers": defaultdict(int), "label": None})
     submitters = defaultdict(lambda: {"settlements": 0, "surplus_wei": 0})
     total_fees = 0
-    agg = Counter()
     ages = []
     ts_mem = {}
     api_check = Counter()
-    per_solver = {s["name"]: {"replayed": 0, "errored": 0, "returned": 0, "valid": 0,
+    per_solver = {s["name"]: {"replayed": 0, "returned": 0, "valid": 0,
                               "positive": 0, "beat": 0, "our_surplus": 0,
                               "winner_surplus": 0, "implausible": 0,
                               # v0.7.2 coverage-adjusted accounting: attempted
@@ -864,11 +1147,26 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                               "our_surplus_exact": 0, "winner_surplus_exact": 0,
                               "rank_rows": [], "econ_rows": [],
                               "invalid": Counter(), "errors": Counter(),
-                              "latency": [], "late": 0}
+                              "latency": [],
+                              # v0.11.0 driver taxonomy: a failure is either a
+                              # deadline miss (timeout, or an answer after the
+                              # budget) or a transport error — never "errored".
+                              "transport": 0, "deadline_miss": 0,
+                              # v0.11.0 validity disclosure
+                              "fairness_filtered": 0, "fairness_evaluated": 0,
+                              "fairness_not_evaluated": 0, "valid_zero_surplus": 0,
+                              "udcp_checked": 0, "udcp_violations": 0,
+                              "basis_mix": Counter()}
                   for s in args.solvers}
     field_econ = []      # per-auction FIELD consistency terms (needs no solver)
     now_ts = time.time()
     done = 0
+    # v0.11.0 window disclosure: when each attempted auction happened
+    attempted_ts = []          # settlement-block timestamps
+    attempted_start_ts = []    # auctionStartBlock timestamps (needs --compete)
+    budget_upper = []          # original_deadline − auctionStartBlock ts, seconds
+    budget_s = float(getattr(args, "budget_s", None) or ASSUMED_BUDGET_S)
+    budget_ms = budget_s * 1000
 
     try:
         for aid in aids:
@@ -965,7 +1263,8 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                    "settlement_block": blk, "block_ts": ts,
                    "age_hours": round(age_h, 2) if age_h is not None else None,
                    "winner_txs": winner_txs, "winner_surplus_wei": winner_total,
-                   "winner_fee_wei": winner_fees, "baseline_quality": baseline_quality}
+                   "winner_fee_wei": winner_fees, "baseline_quality": baseline_quality,
+                   "body_sha256": body_shas.get(aid)}
 
             if args.verify_api:
                 v = verify_against_api(args.chain, aid, [t["tx"] for t in winner_txs])
@@ -973,6 +1272,8 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 row["api_check"] = v
 
             comp_rec = None
+            fair_base = None      # CIP-67 baselines; None = fairness not evaluated
+            start_ts = None
             if args.compete or args.archive_dir:
                 api_base = f"{COW_API}/{CHAINS[args.chain]['api']}"
                 comp_rec = competition.fetch_competition(api_base, aid, _http_get, cache)
@@ -982,6 +1283,18 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     # complements settlement_block, which is always later.
                     row["auction_start_block"] = comp_rec.get("auctionStartBlock")
                     row["auction_deadline_block"] = comp_rec.get("auctionDeadlineBlock")
+                    if isinstance(row["auction_start_block"], int):
+                        start_ts = block_ts(rpcs, row["auction_start_block"], ts_mem,
+                                            cache, max_cacheable)
+                        row["auction_start_ts"] = start_ts
+                    # v0.11.0: the winner's referenceScore, copied for the
+                    # reader; no check consumes it.
+                    winners = [s for s in comp_rec.get("solutions") or [] if s.get("isWinner")]
+                    if winners:
+                        best = max(winners, key=lambda s: int(s.get("score") or 0))
+                        if best.get("referenceScore") is not None:
+                            row["winner_reference_score"] = best["referenceScore"]
+                    fair_base = competition.pair_baselines(comp_rec, body, stats=agg)
                     if args.archive_dir:
                         try:
                             if competition.archive_store(args.archive_dir, args.chain, comp_rec):
@@ -1008,7 +1321,7 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 n_orders = max(len(body.get("orders", [])), 1)
                 row["expired_orders_pct"] = round(100 * expired / n_orders, 1)
                 if args.clamp_validto and expired:
-                    horizon = int(now_ts) + args.solve_timeout + 600
+                    horizon = int(now_ts) + int(budget_s) + 600
                     for o in body.get("orders", []):
                         if int(o.get("validTo", 0)) < now_ts:
                             o["validTo"] = horizon
@@ -1025,15 +1338,31 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                 # wall-clock budget (v0.7.2 made the bytes identical; v0.10.0
                 # makes the budget identical — sequential calls handed the
                 # second solver a deadline the first one had already consumed).
-                body["deadline"] = (datetime.now(timezone.utc)
-                                    + timedelta(seconds=args.solve_timeout)
-                                    ).isoformat().replace("+00:00", "Z")
-                row["replay_deadline"] = body["deadline"]
+                # v0.11.0: the budget is the OBSERVED driver budget (or the
+                # operator's override), never a 20 s constant, and the archived
+                # wire deadline is preserved on the row before it is replaced.
+                stamp_deadline(body, row, budget_s)
+                row["budget_s"] = budget_s
+                row["budget_source"] = getattr(args, "budget_source", "assumed")
+                orig = parse_iso_ts(row.get("original_deadline"))
+                if orig is not None and start_ts is not None:
+                    # upper bound on the true budget: the driver sent the body
+                    # some (unrecorded) time after the auction-start block
+                    row["original_budget_upper_s"] = round(orig - start_ts, 3)
+                    row["original_budget_upper_basis"] = (
+                        "original_deadline minus auctionStartBlock timestamp — an UPPER "
+                        "bound on the driver's real per-request budget (send time unknown)")
+                    budget_upper.append(row["original_budget_upper_s"])
+                if ts is not None:
+                    attempted_ts.append(ts)
+                if start_ts is not None:
+                    attempted_start_ts.append(start_ts)
                 payload = json.dumps(body).encode()
-                for sv, resp, err, ms in dispatch_solvers(args.solvers, payload, args.solve_timeout):
+                for sv, resp, err, ms in dispatch_solvers(args.solvers, payload, budget_s):
                     st = per_solver[sv["name"]]
                     st["attempted"] += 1
                     st["winner_surplus_attempted"] += winner_total
+                    st["basis_mix"][baseline_quality] += 1
                     if baseline_quality == "exact_uniform":
                         # exact-basis denominator accrues on ATTEMPTED too, or
                         # the "cleanest" number carries the survivorship bias
@@ -1041,34 +1370,47 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                         st["winner_surplus_exact"] += winner_total
                     if econ_table is not None and comp_rec is not None:
                         st["rank_eligible"] = st.get("rank_eligible", 0) + 1
-                    if err:
-                        st["errored"] += 1
-                        st["errors"][err] += 1
+                    bucket, reason = classify_outcome(err, ms, budget_ms)
+                    if bucket != "answered":
+                        st[bucket] += 1
+                        st["errors"][reason] += 1
                         st["lost_to_errors"] += winner_total
-                        row["solvers"][sv["name"]] = {"solve_error": err, "latency_ms": ms}
+                        if err is None:
+                            # a LATE answer is still an answer for latency
+                            # purposes — hiding it would flatter p95
+                            st["latency"].append(ms)
+                        row["solvers"][sv["name"]] = {
+                            "solve_error": reason, "driver_result": driver_error_label(reason),
+                            "outcome": bucket, "latency_ms": ms}
                         if econ_table is not None:
                             # the field still earned its terms here; we earned
                             # nothing — keep the auction in BOTH sides
                             st["econ_rows"].append(economics.zero_challenger_row(econ_table))
                         continue
                     try:
-                        vs = validate_and_score(resp, body, ref_prices)
+                        vs = validate_and_score(resp, body, ref_prices, fairness_baseline=fair_base)
                     except Exception as e:
-                        st["errored"] += 1
+                        st["transport"] += 1
                         st["errors"]["bad_solver_response"] += 1
                         st["lost_to_errors"] += winner_total
                         row["solvers"][sv["name"]] = {
                             "solve_error": f"bad_solver_response ({type(e).__name__})",
-                            "latency_ms": ms}
+                            "driver_result": driver_error_label("bad_solver_response"),
+                            "outcome": "transport", "latency_ms": ms}
                         if econ_table is not None:
                             st["econ_rows"].append(economics.zero_challenger_row(econ_table))
                         continue
                     # latency describes ANSWERS; a dead endpoint's fast
                     # failures must not buy it a flattering p95
                     st["latency"].append(ms)
-                    if ms > args.solve_timeout * 1000:
-                        st["late"] += 1
                     st["replayed"] += 1
+                    st["fairness_filtered"] += vs["fairness_filtered"]
+                    st["valid_zero_surplus"] += vs["valid_zero_surplus"]
+                    st["udcp_checked"] += vs["udcp_checked"]
+                    st["udcp_violations"] += vs["udcp_violations"]
+                    if vs["n_solutions"]:
+                        st["fairness_evaluated" if vs["fairness"] == "evaluated"
+                           else "fairness_not_evaluated"] += 1
                     st["winner_surplus"] += winner_total
                     ours = vs["best_surplus_wei"]
                     st["our_surplus"] += ours
@@ -1093,8 +1435,12 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
                     if implausible:
                         st["implausible"] += 1
                     vs_row = {k: vs[k] for k in ("best_surplus_wei", "best_single_wei",
-                                                 "n_solutions", "n_valid", "invalid")}
+                                                 "n_solutions", "n_valid", "invalid",
+                                                 "fairness", "fairness_filtered",
+                                                 "valid_zero_surplus", "udcp_checked",
+                                                 "udcp_violations")}
                     vs_row["latency_ms"] = ms
+                    vs_row["outcome"] = "answered"
                     if implausible:
                         vs_row["flags"] = ["implausible_surplus"]
                     if comp_rec is not None and args.compete:
@@ -1137,6 +1483,8 @@ def process_window(args, rpcs, chain_cfg, frm, to, cache, jout):
             "pair_stats": pair_stats, "submitters": submitters, "total_fees": total_fees,
             "agg": agg, "ages": ages, "per_solver": per_solver, "api_check": api_check,
             "field_econ": field_econ,
+            "attempted_ts": attempted_ts, "attempted_start_ts": attempted_start_ts,
+            "budget_upper": budget_upper, "bodies_source": "archive" if bodies_dir else "s3",
             "interrupted": interrupted, "from_block": frm, "to_block": to, "native": nat}
 
 
@@ -1150,15 +1498,59 @@ def readiness_report(st, args):
     """A one-screen pre-production readiness check for a single solver endpoint:
     did it answer, how fast, and were its solutions sane against the winners?
     Reuses the counterfactual pass's per-solver stats — no extra fetching.
-    Returns a JSON-able dict; also prints the report unless --quiet."""
+    Returns a JSON-able dict; also prints the report unless --quiet.
+
+    v0.11.0: every threshold comes from THRESHOLDS (per-chain overrides on top
+    of `default`), the budget from BUDGETS_S / --solve-timeout (never an
+    assumed constant), failures follow the driver's taxonomy (deadline miss vs
+    transport), a capped or thin sample cannot be READY, and the header says
+    exactly which window, budget and thresholds produced the verdict."""
     reports = []
+    chain = getattr(args, "chain", None)
+    env = getattr(args, "env", None)
+    budget_s = getattr(args, "budget_s", None)
+    budget_source = getattr(args, "budget_source", None)
+    if budget_s is None:
+        budget_s, budget_source = resolve_budget(
+            chain, getattr(args, "solve_timeout", None), readiness=True)
+    budget_s = float(budget_s)
+    budget_ms = budget_s * 1000
+    thr, profile, thr_src = resolve_thresholds(chain, getattr(args, "min_evidence", None))
+    min_evidence = thr["min_evidence"]
+    cap = int(getattr(args, "max_auctions", 0) or 0)
+
+    # window disclosure (shared by every solver in the run)
+    found = len(st.get("txs") or [])
+    n_found = st.get("n_found", 0)
+    sk = st.get("skip") or {}
+    excl = exclusion_count(sk)
+    top_excl = sorted(((k, v) for k, v in sk.items() if k not in _NON_EXCLUSION_SKIPS),
+                      key=lambda kv: -kv[1])[:3]
+    unscanned = sum(hi - lo + 1 for lo, hi in (st.get("failed_ranges") or []))
+    span_src = st.get("attempted_start_ts") or st.get("attempted_ts") or []
+    ts_basis = ("auctionStartBlock timestamps" if st.get("attempted_start_ts")
+                else "settlement-block timestamps")
+    span_start = min(span_src) if span_src else None
+    span_end = max(span_src) if span_src else None
+    span_hours = ((span_end - span_start) / 3600.0
+                  if span_src and span_end > span_start else None)
+    bu = sorted(st.get("budget_upper") or [])
+    upper = ({"p50_s": _percentile(bu, 0.5), "p95_s": _percentile(bu, 0.95), "n": len(bu),
+              "basis": "original_deadline minus auctionStartBlock timestamp (upper bound)"}
+             if bu else None)
+    clamped = (st.get("agg") or {}).get("validto_clamped_auctions", 0)
+
+    def _iso(t):
+        return (datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")
+                .replace("+00:00", "Z") if t is not None else "n/a")
+
     for sv in args.solvers:
         s = st["per_solver"][sv["name"]]
-        attempted = s.get("attempted") or (s["replayed"] + s["errored"])
+        transport = s.get("transport", 0)
+        dmiss = s.get("deadline_miss", 0)
+        attempted = s.get("attempted") or (s["replayed"] + transport + dmiss)
         lat = sorted(s["latency"])
-        p50 = lat[len(lat) // 2] if lat else None
-        p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else None
-        pmax = lat[-1] if lat else None
+        p50, p95, pmax = _percentile(lat, 0.5), _percentile(lat, 0.95), (lat[-1] if lat else None)
         # v0.7.2 semantics split: an HTTP-200 `{"solutions": []}` is a HEALTHY
         # answer (the schema's legitimate abstention), not an endpoint
         # failure — so answer rate counts parsed responses (replayed), and
@@ -1166,13 +1558,26 @@ def readiness_report(st, args):
         answer_rate = _pct(s["replayed"], attempted)
         bid_rate = _pct(s["returned"], s["replayed"])
         valid_rate = _pct(s["valid"], s["returned"])
+        transport_rate = _pct(transport, attempted)
+        dmiss_rate = _pct(dmiss, attempted)
         # Coverage-adjusted capture is the honest readiness read: errors keep
         # the historical winner in the denominator (survivorship-bias fix).
         capture_adj = _pct(s["our_surplus"],
                            s.get("winner_surplus_attempted") or s["winner_surplus"])
         capture_cond = _pct(s["our_surplus"], s["winner_surplus"])
         capture = capture_adj
-        # A conservative pass/warn read for a first-time integrator.
+        basis_mix = dict(s.get("basis_mix") or {})
+        fe, fne = s.get("fairness_evaluated", 0), s.get("fairness_not_evaluated", 0)
+        if fe and not fne:
+            validity_basis = "feasibility+eligibility+udcp+fairness"
+        elif fe:
+            validity_basis = f"feasibility+eligibility+udcp+fairness:partial({fe}/{fe + fne} evaluated)"
+        else:
+            validity_basis = "feasibility+eligibility+udcp+fairness:not-evaluated"
+        auctions_per_hour = (round(attempted / span_hours, 2)
+                             if span_hours and attempted else None)
+        errors = driver_error_table(s["errors"])
+
         checks = []
 
         def chk(ok, warn, label, detail, _out=checks):
@@ -1181,31 +1586,42 @@ def readiness_report(st, args):
         chk(attempted > 0, False, "reached auctions",
             f"{attempted} auctions attempted")
         if attempted:
-            chk(s["errored"] == 0, s["errored"] < attempted, "no transport errors",
-                f"{s['errored']}/{attempted} errored" if s["errored"] else "0 errors")
-            chk((answer_rate or 0) >= 90, (answer_rate or 0) >= 50, "answers reliably",
-                f"{answer_rate:.0f}% returned a parseable response (incl. legitimate "
-                f"empty solutions)" if answer_rate is not None else "n/a")
+            chk(transport == 0, (transport_rate or 0) <= thr["transport_warn"],
+                "no transport errors",
+                (f"{transport}/{attempted} ({transport_rate:.2f}%) transport errors "
+                 f"[{', '.join(k for k in errors if k != 'DeadlineExceeded')}]")
+                if transport else "0 transport errors")
+            chk((answer_rate or 0) >= thr["answer_rate_pass"],
+                (answer_rate or 0) >= thr["answer_rate_warn"], "answers reliably",
+                f"{answer_rate:.0f}% returned a parseable response inside the budget (incl. "
+                f"legitimate empty solutions)" if answer_rate is not None else "n/a")
             if s["replayed"]:
                 # Low bid coverage is a strategy fact, not an endpoint fault —
                 # warn at most, never fail.
-                chk((bid_rate or 0) >= 50, True, "bid coverage",
+                chk((bid_rate or 0) >= thr["bid_coverage_pass"], True, "bid coverage",
                     f"{bid_rate:.0f}% of answered auctions carried >=1 solution"
                     if bid_rate is not None else "n/a")
-            chk(s["late"] == 0, s["late"] * 5 <= attempted, "inside the deadline",
-                f"{s['late']} past the advertised deadline"
-                if s["late"] else "0 past deadline")
+            chk(dmiss == 0, (dmiss_rate or 0) <= thr["deadline_miss_warn"], "inside the deadline",
+                (f"{dmiss}/{attempted} ({dmiss_rate:.2f}%) deadline misses [DeadlineExceeded: "
+                 f"{errors.get('DeadlineExceeded', {})}]") if dmiss else "0 deadline misses")
             if p95 is not None:
-                budget = args.solve_timeout * 1000
-                chk(p95 <= budget * 0.5, p95 <= budget, "latency headroom",
-                    f"p95 {p95} ms of a {budget} ms budget")
+                chk(p95 <= budget_ms * thr["latency_pass_frac"],
+                    p95 <= budget_ms * thr["latency_warn_frac"], "latency headroom",
+                    f"p95 {p95} ms of a {budget_ms:.0f} ms budget ({budget_source}); "
+                    f"PASS <= {thr['latency_pass_frac']:g}x, WARN <= {thr['latency_warn_frac']:g}x")
             if s["returned"]:
-                chk((valid_rate or 0) >= 90, (valid_rate or 0) >= 50, "solutions are valid",
-                    f"{valid_rate:.0f}% of bid auctions had >=1 valid solution"
+                chk((valid_rate or 0) >= thr["validity_pass"],
+                    (valid_rate or 0) >= thr["validity_warn"], "solutions are valid",
+                    (f"{valid_rate:.0f}% of bid auctions had >=1 valid solution "
+                     f"[{validity_basis}; fairness_filtered {s.get('fairness_filtered', 0)}, "
+                     f"zero_surplus {s.get('valid_zero_surplus', 0)}, "
+                     f"udcp {s.get('udcp_checked', 0)} checked / "
+                     f"{s.get('udcp_violations', 0)} violations]")
                     if valid_rate is not None else "n/a")
-                chk((capture or 0) >= 50, (capture or 0) > 0, "competitive vs winners",
-                    f"{capture:.0f}% of winner surplus captured (coverage-adjusted; "
-                    f"{capture_cond:.0f}% conditional on answering)"
+                chk((capture or 0) >= thr["capture_pass"], (capture or 0) > thr["capture_warn"],
+                    "competitive vs winners",
+                    (f"{capture:.0f}% of winner surplus captured (coverage-adjusted; "
+                     f"{capture_cond:.0f}% conditional on answering; basis mix {basis_mix})")
                     if capture is not None and capture_cond is not None else "n/a")
             elif s["replayed"]:
                 # Healthy endpoint that never bid: nothing to assess — that is
@@ -1218,12 +1634,9 @@ def readiness_report(st, args):
                     f"{s['implausible']} auction(s) flagged implausible_surplus")
             # Coverage disclosure: a verdict against a partial field is only
             # meaningful if the reader can see how partial. Never a hard fail
-            # (it's environmental, not the solver's doing) — but >5% excluded
-            # or ANY unscanned span downgrades to REVIEW so the number gets
-            # read. Every skip reason that removes a settlement from the
-            # baseline counts (v0.10.0; two of ~eight used to).
-            found = len(st.get("txs") or [])
-            unscanned = sum(hi - lo + 1 for lo, hi in (st.get("failed_ranges") or []))
+            # (it's environmental, not the solver's doing) — but excluded
+            # above the table fraction or ANY unscanned span downgrades to
+            # REVIEW so the number gets read.
             if unscanned:
                 span = (st.get("to_block", 0) - st.get("from_block", 0) + 1) or 1
                 chk(False, True, "scan coverage",
@@ -1232,44 +1645,82 @@ def readiness_report(st, args):
             else:
                 chk(True, True, "scan coverage", "every block in the window was scanned")
             if found:
-                sk = st.get("skip") or {}
-                excl = exclusion_count(sk)
-                chk(excl <= 0.05 * found, True, "field coverage",
-                    f"{found} settlements, {st.get('n_found', 0)} auctions formed, "
-                    f"{excl} excluded ({100 * excl / found:.0f}% of field; reasons in "
-                    f"the coverage block)")
-            clamped = (st.get("agg") or {}).get("validto_clamped_auctions", 0)
+                chk(excl <= thr["field_coverage_excluded_max_frac"] * found, True, "field coverage",
+                    f"{found} settlements, {n_found} auctions formed, "
+                    f"{excl} excluded ({100 * excl / found:.0f}% of field; top reasons "
+                    f"{top_excl})")
             if clamped:
                 chk(False, True, "bodies unmodified",
                     f"--clamp-validto extended expired validTo on {clamped} auction(s) "
                     f"({(st.get('agg') or {}).get('validto_clamped_orders', 0)} orders); "
                     f"replay bodies differ from the archived auctions")
+            if cap:
+                # a capped sample is a slice of the field, not the field
+                chk(False, True, "sample capped",
+                    f"--max-auctions {cap}: a capped sample cannot be READY")
         verdict = ("READY" if all(c["level"] == "ok" for c in checks)
                    else "NOT READY" if any(c["level"] == "fail" for c in checks)
                    else "REVIEW")
-        # Evidence floor (v0.7.2): READY is a strong claim — one lucky auction
-        # must not produce it. Below the floor the best verdict is REVIEW.
-        min_evidence = getattr(args, "min_evidence", 10)
+        # Evidence floor: READY is a strong claim — a thin sample must not
+        # produce it. Below the floor the best verdict is REVIEW.
         if verdict == "READY" and attempted < min_evidence:
             verdict = "REVIEW"
             chk(False, True, "sufficient evidence",
                 f"only {attempted} auction(s) attempted; READY needs >= "
-                f"{min_evidence} (--min-evidence)")
+                f"{min_evidence} (min_evidence, {thr_src['min_evidence']})")
+
+        bodies = (getattr(args, "archive_bodies", None) or getattr(args, "bodies_dir", None)
+                  or "<bodies-dir: rerun with --archive-bodies DIR to make this reproducible>")
+        frm, to = st.get("from_block"), st.get("to_block")
+        reproduce = (
+            f"cow-backtester --chain {chain} --env {env} --from-block {frm} --to-block {to} "
+            f"--bodies-dir {bodies} --solve-timeout {budget_s:g} --min-evidence {min_evidence}"
+            + (f" --max-auctions {cap}" if cap else "")
+            + (" --compete" if getattr(args, "compete", False) else "")
+            + f" \\\n        --rpc-url <rpc> --solver-url {sv['url']} --solver-name {sv['name']} --readiness"
+            f"\n    # cow-backtester {VERSION} · engine build sha: "
+            + (getattr(args, "engine_sha", None)
+               or "<fill in: the endpoint's boot-line git_sha (not exposed over /solve)>"))
+
         rep = {
             "solver": sv["name"], "url": sv["url"], "verdict": verdict,
+            "chain": chain, "env": env,
             "auctions_attempted": attempted, "answered": s["replayed"],
-            "bids": s["returned"],
+            "bids": s["returned"], "valid": s["valid"],
             "answer_rate_pct": answer_rate, "bid_rate_pct": bid_rate,
-            "errored": s["errored"],
-            "valid_rate_pct": valid_rate, "capture_pct": capture,
-            "capture_conditional_pct": capture_cond,
+            "valid_rate_pct": valid_rate,
+            "transport": transport, "deadline_miss": dmiss,
+            "transport_rate_pct": transport_rate, "deadline_miss_rate_pct": dmiss_rate,
+            "errors": errors,
+            "capture_pct": capture, "capture_conditional_pct": capture_cond,
+            "basis_mix": basis_mix,
             "p50_ms": p50, "p95_ms": p95, "max_ms": pmax,
-            "past_deadline": s["late"], "solve_timeout_s": args.solve_timeout,
+            "latency_basis": ("answered auctions only, late answers included; a dead "
+                              "endpoint's fast failures must not flatter p95"),
+            "budget_s": budget_s, "budget_source": budget_source,
+            "original_budget_upper_s": upper,
+            "validity_basis": validity_basis,
+            "fairness_filtered": s.get("fairness_filtered", 0),
+            "fairness_evaluated": fe, "fairness_not_evaluated": fne,
+            "valid_zero_surplus": s.get("valid_zero_surplus", 0),
+            "udcp_checked": s.get("udcp_checked", 0),
+            "udcp_violations": s.get("udcp_violations", 0),
+            "thresholds": thr, "threshold_profile": profile, "threshold_sources": thr_src,
+            "min_evidence": min_evidence, "sample_capped": cap,
+            "window": {"from_block": frm, "to_block": to,
+                       "span_start_ts": span_start, "span_end_ts": span_end,
+                       "span_hours": round(span_hours, 3) if span_hours is not None else None,
+                       "ts_basis": ts_basis},
+            "auctions_per_hour": auctions_per_hour,
+            "counts": {"settlements_found": found, "auctions_formed": n_found,
+                       "attempted": attempted, "replayed": s["replayed"],
+                       "returned": s["returned"]},
+            "excluded": {"n": excl, "top": top_excl},
             "implausible": s["implausible"], "checks": checks,
-            "errors": dict(s["errors"]),
             "unscanned_blocks": unscanned,
-            "skipped": dict(st.get("skip") or {}),
+            "skipped": dict(sk),
             "validto_clamped_auctions": clamped,
+            "reproduce": reproduce,
         }
         reports.append(rep)
         # --quiet silences PROGRESS (stderr), never the verdict: a CI gate
@@ -1278,32 +1729,60 @@ def readiness_report(st, args):
         print()
         print("=" * 68)
         print(f"  READINESS — {sv['name']}   [{verdict}]")
-        print(f"  {args.chain} · {args.env} · blocks {st['from_block']}..{st['to_block']}")
+        print(f"  {chain} · {env} · blocks {frm}..{to}")
         print("=" * 68)
+        print(f"  window  : blocks {frm}..{to} | attempted auctions span "
+              f"{_iso(span_start)} → {_iso(span_end)}"
+              + (f" ({span_hours:.2f} h, {ts_basis}; {auctions_per_hour} attempted/h)"
+                 if span_hours is not None else f" ({ts_basis})"))
+        print(f"            settlements found {found} / auctions formed {n_found} / attempted "
+              f"{attempted} / replayed {s['replayed']} / returned {s['returned']}")
+        print(f"            excluded {excl}" + (f" — top: {top_excl}" if top_excl else ""))
+        print(f"  budget  : {budget_s:.3f} s ({budget_source}"
+              + (f", BUDGETS_S[{chain}].settle" if budget_source == "observed" else "")
+              + ")"
+              + (f" | original-deadline upper bound p50 {upper['p50_s']:.3f} s / p95 "
+                 f"{upper['p95_s']:.3f} s over {upper['n']} attempted"
+                 if upper else " | original-deadline upper bound n/a (needs --compete)"))
+        ov = {k for k, v in thr_src.items() if v == "override"}
+        print(f"  thresholds: profile '{profile}' — "
+              f"answer_rate >={thr['answer_rate_pass']:g}/{thr['answer_rate_warn']:g}% · "
+              f"transport 0/<={thr['transport_warn']:g}% · "
+              f"deadline_miss 0/<={thr['deadline_miss_warn']:g}% · "
+              f"latency p95 <={thr['latency_pass_frac']:g}x/{thr['latency_warn_frac']:g}x budget · "
+              f"validity >={thr['validity_pass']:g}/{thr['validity_warn']:g}% · "
+              f"capture >={thr['capture_pass']:g}/>{thr['capture_warn']:g}% · "
+              f"min_evidence {min_evidence}"
+              + (f" (override: {', '.join(sorted(ov))})" if ov else ""))
+        if cap:
+            print(f"  SAMPLE CAPPED (--max-auctions {cap}): a capped sample cannot be READY")
+        if attempted < min_evidence:
+            print(f"  INSUFFICIENT SAMPLE (attempted {attempted} < {min_evidence})")
         for c in checks:
             print(f"  [{mark[c['level']]}] {c['label']:<24} {c['detail']}")
         print("  " + "-" * 64)
         print(f"  answered            : {s['replayed']}/{attempted}"
               + (f"  ({answer_rate:.0f}%)" if answer_rate is not None else "")
-              + f"   bids: {s['returned']}")
+              + f"   bids: {s['returned']}   transport: {transport}   deadline misses: {dmiss}")
         if p50 is not None:
             print(f"  latency             : p50 {p50} ms / p95 {p95} ms / max {pmax} ms"
-                  f"   (budget {args.solve_timeout * 1000} ms)")
+                  f"   (budget {budget_ms:.0f} ms; answered-only incl. late answers)")
         if capture is not None:
-            print(f"  surplus vs winners  : {capture:.0f}% captured"
-                  f"   ({s['valid']}/{s['replayed']} valid)")
+            print(f"  surplus vs winners  : {capture:.0f}% captured (coverage-adjusted)"
+                  + (f" / {capture_cond:.0f}% conditional" if capture_cond is not None else "")
+                  + f"   ({s['valid']}/{s['replayed']} valid)")
+        if basis_mix:
+            print(f"  winner basis mix    : {basis_mix}")
+        print(f"  validity basis      : {validity_basis}")
         if s["errors"]:
-            print(f"  errors              : {dict(s['errors'])}")
+            print(f"  errors              : {errors}")
         print()
         print("  Reproduce this run:")
-        blk = f"--from-block {st['from_block']} --to-block {st['to_block']}"
-        print(f"    cow-backtester --chain {args.chain} --env {args.env} {blk} \\")
-        print(f"        --rpc-url <rpc> --solver-url {sv['url']} --solver-name {sv['name']} --readiness")
+        print("    " + reproduce)
     print()
     print("  Note: replays live liquidity against archived auctions — a readiness")
     print("  signal, not a settlement guarantee. Pair with self-hosted shadow before prod.")
     return reports
-
 
 def print_scorecard(st, args, cache, solver_names_map=None):
     nat = st["native"]
@@ -1379,10 +1858,12 @@ def print_scorecard(st, args, cache, solver_names_map=None):
     # per-solver counterfactual
     for sv in args.solvers:
         s = st["per_solver"][sv["name"]]
+        failed = s.get("transport", 0) + s.get("deadline_miss", 0)
         print()
         print("=" * 68)
         print(f"  COUNTERFACTUAL — {sv['name']}  ({s['replayed']} replayed"
-              + (f", {s['errored']} errored/EXCLUDED" if s["errored"] else "") + ")")
+              + (f", {s.get('transport', 0)} transport + {s.get('deadline_miss', 0)} "
+                 f"deadline-miss/EXCLUDED" if failed else "") + ")")
         print("=" * 68)
         if s["replayed"] == 0:
             print("  ⚠ SOLVER NEVER ANSWERED — scorecard void.")
@@ -1450,9 +1931,9 @@ def print_scorecard(st, args, cache, solver_names_map=None):
             p50 = lat[len(lat) // 2]
             p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))]
             print(f"  solve latency       : p50 {p50} ms / p95 {p95} ms"
-                  + (f"   ⚠ {s['late']} past the advertised deadline" if s["late"] else ""))
+                  + (f"   ⚠ {s['deadline_miss']} deadline miss(es)" if s.get("deadline_miss") else ""))
         if s["errors"]:
-            print(f"  solve errors        : {dict(s['errors'])}  (excluded from sums)")
+            print(f"  solve errors        : {driver_error_table(s['errors'])}  (excluded from sums)")
         if s["invalid"]:
             print(f"  invalid solutions   : {dict(s['invalid'])}  (excluded from scoring)")
         if s["implausible"]:
@@ -1504,7 +1985,8 @@ def print_scorecard(st, args, cache, solver_names_map=None):
         w2 = s2.get("winner_surplus_attempted") or s2["winner_surplus"]
         c1, c2 = _pct(s1["our_surplus"], w1), _pct(s2["our_surplus"], w2)
         line("capture % (adjusted)", "n/a" if c1 is None else f"{c1:.1f}", "n/a" if c2 is None else f"{c2:.1f}")
-        line("errored", s1["errored"], s2["errored"])
+        line("transport errors", s1.get("transport", 0), s2.get("transport", 0))
+        line("deadline misses", s1.get("deadline_miss", 0), s2.get("deadline_miss", 0))
         if s1["latency"] and s2["latency"]:
             line("latency p50 ms", sorted(s1["latency"])[len(s1["latency"]) // 2],
                  sorted(s2["latency"])[len(s2["latency"]) // 2])
@@ -1557,7 +2039,10 @@ def build_summary(st, args, extra, solver_names_map=None):
         lat = sorted(s["latency"])
         wsa = s.get("winner_surplus_attempted") or s["winner_surplus"]
         solvers.append({
-            "name": sv["name"], "replayed": s["replayed"], "errored": s["errored"],
+            "name": sv["name"], "replayed": s["replayed"],
+            "transport": s.get("transport", 0), "deadline_miss": s.get("deadline_miss", 0),
+            "failed": s.get("transport", 0) + s.get("deadline_miss", 0),
+            "errors": driver_error_table(s.get("errors")),
             "returned": s["returned"], "valid": s["valid"], "positive": s["positive"],
             "beat": s["beat"], "our_surplus": s["our_surplus"],
             # Headline = coverage-adjusted (errors keep the winner in the
@@ -1621,7 +2106,7 @@ def build_summary(st, args, extra, solver_names_map=None):
 
 # ---------------------------------------------------------------------- CLI
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(
         prog="cow-backtester",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1638,15 +2123,20 @@ def main():
                     help="scan the most recent N blocks (head-relative)")
     ap.add_argument("--from-block", type=int, default=None, help="absolute scan start (reproducible)")
     ap.add_argument("--to-block", type=int, default=None, help="absolute scan end; omit to use the chain head")
-    ap.add_argument("--max-auctions", type=int, default=25,
-                    help="cap auctions scored, newest first (0 = all)")
+    ap.add_argument("--max-auctions", type=int, default=0,
+                    help="cap auctions scored, newest first (0 = all). A capped "
+                         "sample is a slice of the field: --readiness then caps the "
+                         "verdict at REVIEW")
     ap.add_argument("--rpc-url", default=None, help="chain RPC (recommended)")
     ap.add_argument("--solver-url", action="append", default=[],
                     help="solver /solve endpoint; repeat for A/B")
     ap.add_argument("--solver-name", action="append", default=[],
                     help="label for the corresponding --solver-url")
-    ap.add_argument("--solve-timeout", type=int, default=20,
-                    help="deadline advertised to the solver, seconds (HTTP waits +5)")
+    ap.add_argument("--solve-timeout", type=float, default=None,
+                    help="OVERRIDE the per-request budget advertised to the solver, "
+                         "seconds (HTTP waits +5). Default: the observed driver budget "
+                         "for the chain (BUDGETS_S); --readiness refuses to run on a "
+                         "chain with no observed value unless this is given")
     ap.add_argument("--workers", type=int, default=8, help="concurrent RPC/S3 fetches")
     ap.add_argument("--cache-dir", default=".cowbt-cache", help="cache directory")
     ap.add_argument("--no-cache", action="store_true", help="disable the cache")
@@ -1654,13 +2144,22 @@ def main():
     ap.add_argument("--html-out", default=None, help="write a single-file HTML report")
     ap.add_argument("--solver-map", default=None,
                     help="JSON {address: name} to label winning submitters")
+    ap.add_argument("--archive-bodies", default=None, metavar="DIR",
+                    help="store every auction body used in the run as "
+                         "DIR/<chain>/<auction_id>.json.gz plus DIR/manifest.jsonl, so the "
+                         "run can be reproduced after the S3 bucket evicts the bodies")
+    ap.add_argument("--bodies-dir", default=None, metavar="DIR",
+                    help="replay from a --archive-bodies archive instead of S3; a body "
+                         "missing from the archive is skipped as body_not_archived, "
+                         "never fetched")
     ap.add_argument("--readiness", action="store_true",
                     help="print a one-screen pre-prod readiness check for the "
                          "solver endpoint(s) instead of the full field scorecard "
                          "(answer rate, latency, validity, surplus vs winners)")
-    ap.add_argument("--min-evidence", type=int, default=10,
-                    help="minimum attempted auctions before --readiness may say "
-                         "READY (below it the best verdict is REVIEW)")
+    ap.add_argument("--min-evidence", type=int, default=None,
+                    help="OVERRIDE the minimum attempted auctions before --readiness "
+                         "may say READY (below it the best verdict is REVIEW). "
+                         "Default: THRESHOLDS min_evidence (500)")
     ap.add_argument("--fail-on", choices=["not-ready", "review"], default=None,
                     help="with --readiness: exit 4 when any endpoint's verdict is "
                          "NOT READY (not-ready) or REVIEW-or-worse (review) — a CI gate")
@@ -1695,7 +2194,12 @@ def main():
     ap.add_argument("--quiet", action="store_true",
                     help="suppress progress output (scorecard still prints to stdout)")
     ap.add_argument("--version", action="version", version=f"cow-backtester {VERSION}")
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
 
     global QUIET
     QUIET = args.quiet
@@ -1704,8 +2208,12 @@ def main():
         ap.error("--blocks must be > 0")
     if args.max_auctions < 0:
         ap.error("--max-auctions must be >= 0")
-    if args.solve_timeout < 3:
-        ap.error("--solve-timeout must be >= 3 seconds")
+    if args.solve_timeout is not None and args.solve_timeout <= 0:
+        ap.error("--solve-timeout must be > 0 seconds")
+    if args.min_evidence is not None and args.min_evidence < 1:
+        ap.error("--min-evidence must be >= 1")
+    if args.archive_bodies and args.bodies_dir:
+        ap.error("--archive-bodies and --bodies-dir are exclusive (an archive replays from itself)")
     if args.workers < 1:
         ap.error("--workers must be >= 1")
     if args.to_block is not None and args.from_block is None:
@@ -1723,6 +2231,14 @@ def main():
     if len(set(names)) != len(names):
         ap.error("--solver-name values must be unique")
     args.solvers = [{"url": u, "name": n} for u, n in zip(args.solver_url, names, strict=True)]
+
+    # The per-request budget, resolved ONCE and printed everywhere it matters.
+    # --readiness on a chain with no observed budget and no override exits 2
+    # here, before any network call (v0.11.0).
+    args.budget_s, args.budget_source = resolve_budget(
+        args.chain, args.solve_timeout, readiness=bool(args.readiness and args.solvers))
+    if args.solvers:
+        say(f"      per-request budget {args.budget_s:g} s ({args.budget_source})")
 
     solver_names_map = None
     if args.solver_map:
@@ -1820,6 +2336,11 @@ def main():
             jout.write(json.dumps({"_meta": {
                 "v": VERSION, "chain": args.chain, "env": args.env,
                 "from_block": st["from_block"], "to_block": st["to_block"],
+                "budget_s": args.budget_s, "budget_source": args.budget_source,
+                "bodies_source": st.get("bodies_source"),
+                "archive_bodies": args.archive_bodies, "bodies_dir": args.bodies_dir,
+                "max_auctions": args.max_auctions,
+                "threshold_profile": resolve_thresholds(args.chain, args.min_evidence)[1],
                 "settlement_txs_found": len(st["txs"]),
                 "auctions_formed": st["n_found"], "rows": len(st["rows"]),
                 "skipped": dict(st["skip"]),

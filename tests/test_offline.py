@@ -417,12 +417,17 @@ def test_report_render_utf8(tmp_path):
 
 class _Args:
     """Minimal args stand-in for readiness_report (no network, no argparse)."""
-    def __init__(self, solvers, chain="base", env="prod", solve_timeout=15, quiet=True):
+    def __init__(self, solvers, chain="base", env="prod", solve_timeout=15, quiet=True,
+                 min_evidence=10, max_auctions=0):
         self.solvers = solvers
         self.chain = chain
         self.env = env
         self.solve_timeout = solve_timeout
         self.quiet = quiet
+        # v0.11.0: the table floor is 500; these legacy fixtures carry 20
+        # auctions, so they pin the CLI override path explicitly.
+        self.min_evidence = min_evidence
+        self.max_auctions = max_auctions
 
 
 def _st(per_solver, frm=1000, to=2000):
@@ -430,10 +435,10 @@ def _st(per_solver, frm=1000, to=2000):
 
 
 def _solver_stat(**over):
-    base = {"replayed": 0, "errored": 0, "returned": 0, "valid": 0, "positive": 0,
-            "beat": 0, "our_surplus": 0, "winner_surplus": 0, "implausible": 0,
+    base = {"replayed": 0, "transport": 0, "deadline_miss": 0, "returned": 0, "valid": 0,
+            "positive": 0, "beat": 0, "our_surplus": 0, "winner_surplus": 0, "implausible": 0,
             "invalid": __import__("collections").Counter(),
-            "errors": __import__("collections").Counter(), "latency": [], "late": 0}
+            "errors": __import__("collections").Counter(), "latency": []}
     base.update(over)
     return base
 
@@ -448,12 +453,12 @@ def test_readiness_healthy_endpoint_is_ready():
     assert rep["verdict"] == "READY"
     assert rep["answer_rate_pct"] == 100.0
     assert rep["capture_pct"] == 60.0
-    assert rep["p50_ms"] == 180 and rep["past_deadline"] == 0
+    assert rep["p50_ms"] == 180 and rep["deadline_miss"] == 0
     assert all(c["level"] == "ok" for c in rep["checks"])
 
 
 def test_readiness_never_answered_is_not_ready():
-    s = _solver_stat(errored=15, latency=[10] * 15,
+    s = _solver_stat(deadline_miss=15, latency=[],
                      errors=__import__("collections").Counter({"timeout": 15}))
     args = _Args([{"name": "dead", "url": "http://x"}])
     rep = backtest.readiness_report(_st({"dead": s}), args)[0]
@@ -465,13 +470,16 @@ def test_readiness_never_answered_is_not_ready():
 def test_readiness_slow_but_answering_is_review():
     # answers + valid, but p95 blows the whole budget and some go past deadline.
     budget_ms = 15 * 1000
-    s = _solver_stat(replayed=20, returned=20, valid=20, positive=20,
-                     our_surplus=8 * 10**17, winner_surplus=10**18,
-                     latency=[budget_ms - 100] * 20, late=1)
+    # v0.11.0: deadline misses are graded in the driver's band (WARN <= 1%,
+    # FAIL above) — 1 miss in 101 attempted is 0.99%, a WARN, not a fail.
+    s = _solver_stat(replayed=100, returned=100, valid=100, positive=100,
+                     attempted=101, our_surplus=8 * 10**17, winner_surplus=10**18,
+                     winner_surplus_attempted=10**18,
+                     latency=[budget_ms - 100] * 100, deadline_miss=1)
     args = _Args([{"name": "slow", "url": "http://x"}], solve_timeout=15)
     rep = backtest.readiness_report(_st({"slow": s}), args)[0]
     assert rep["verdict"] == "REVIEW"          # warns, no hard fail
-    assert rep["past_deadline"] == 1
+    assert rep["deadline_miss"] == 1
     assert not any(c["level"] == "fail" for c in rep["checks"])
     assert any(c["level"] == "warn" for c in rep["checks"])
 
@@ -494,7 +502,10 @@ def test_readiness_report_is_json_serializable():
     args = _Args([{"name": "mine", "url": "http://x"}])
     rep = backtest.readiness_report(_st({"mine": s}), args)
     json.dumps(rep)   # must not raise — it lands in the summary JSON/HTML
-    assert rep[0]["errors"] == {"bad_solver_response": 1}
+    # v0.11.0: driver labels on top, fine-grained reason underneath
+    assert rep[0]["errors"] == {"SolverDtoError": {"bad_solver_response": 1}}
+    for gone in ("errored", "past_deadline", "late"):
+        assert gone not in rep[0]
 
 
 # ---------------------------------------------------------------- v0.7.1: wrapper coverage
@@ -583,7 +594,7 @@ def test_readiness_capture_is_coverage_adjusted():
     """Audit P0 (survivorship bias): an errored 100 ETH auction must stay in
     the capture denominator; conditional capture stays as the diagnostic."""
     C = __import__("collections").Counter
-    s = _solver_stat(replayed=10, errored=10, attempted=20,
+    s = _solver_stat(replayed=10, deadline_miss=10, attempted=20,
                      returned=10, valid=10, positive=10,
                      our_surplus=10**18, winner_surplus=10**18,
                      winner_surplus_attempted=101 * 10**18,
