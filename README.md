@@ -51,7 +51,11 @@ API (`POST /solve`).
 If you are bringing up a new solver and want a fast "is this endpoint healthy
 enough to face production auctions?" read, `--readiness` prints a one-screen
 report instead of the full field scorecard. We hold ourselves to it: our own
-Base solver's report is committed under `docs/readiness/` (the 2026-08-22 one is
+solvers' reports, run past the 500-auction floor with 0.11.0 on 2026-09-14, are
+committed under `docs/readiness/` —
+[Arbitrum](docs/readiness/kaisersolver-arbitrum-one-2026-09-14.md),
+[Base](docs/readiness/kaisersolver-base-2026-09-14.md),
+[BNB](docs/readiness/kaisersolver-bnb-2026-09-14.md) (the 2026-08-22 Base report is
 kept there, marked superseded by the 0.11.0 method).
 
 ```bash
@@ -105,7 +109,7 @@ a 300-block run on 2026-09-14 with 0.11.0 (RPC redacted, nothing else):
 
 Twenty-nine auctions is a smoke test, not evidence: the verdict is held at REVIEW by the
 500-auction floor no matter how the checks read, and the header says so. The full-window
-report, run to the floor, follows in `docs/readiness/`.
+reports, run past the floor on all three chains the same day, are the three files linked above.
 
 It prints the exact `--from-block/--to-block` command to reproduce the run,
 and the same data lands in `--json-out`/`--html-out` under `readiness`
