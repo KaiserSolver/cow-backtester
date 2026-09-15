@@ -80,6 +80,26 @@ def render(summary, rows, path):
                      f"<td>{_esc(c.get('detail'))}</td></tr>")
         p.append("</table></div>")
 
+    # maker metrics (additive; only when --maker-metrics-db ran)
+    mm = summary.get("maker_metrics")
+    if mm:
+        p.append(f"<h2>Maker metrics — {_esc(mm.get('maker'))} <span class='note'>{_esc(mm['window'][0])} → {_esc(mm['window'][1])}</span></h2>")
+        p.append("<div class='scroll'><table><tr><th>week</th><th>lane</th><th>pair</th><th>requests</th><th>quotes</th>"
+                 "<th>bids</th><th>wins</th><th>fills</th><th>req/fill</th><th>no-stream</th></tr>")
+        for t_ in mm.get("weekly_totals", []):
+            fr = "-" if t_.get("fill_ratio") is None else f"{t_['fill_ratio']:.0f}"
+            p.append(f"<tr><td><b>{_esc(t_['week'])}</b></td><td>{_esc(t_['lane'])}</td><td><i>all pairs</i></td><td>{t_['requests']:,}</td>"
+                     f"<td>{t_['quotes']:,}</td><td>{t_['bids']:,}</td><td>{t_['wins']:,}</td><td>{t_['fills']:,}</td><td>{fr}</td><td>-</td></tr>")
+        for r_ in mm.get("rows", [])[:200]:
+            fr = "-" if r_.get("fill_ratio") is None else f"{r_['fill_ratio']:.0f}"
+            ns = "-" if r_.get("no_stream_share") is None else f"{r_['no_stream_share']:.0%}"
+            p.append(f"<tr><td>{_esc(r_['week'])}</td><td>{_esc(r_['lane'])}</td><td>{_esc(r_['pair'])}</td><td>{r_['requests']:,}</td>"
+                     f"<td>{(r_['quotes'] or 0):,}</td><td>{'-' if r_['bids'] is None else r_['bids']}</td><td>{'-' if r_['wins'] is None else r_['wins']}</td>"
+                     f"<td>{r_['fills']}</td><td>{fr}</td><td>{ns}</td></tr>")
+        p.append("</table></div>")
+        for n in mm.get("notes", []):
+            p.append(f'<p class="note">{_esc(n)}</p>')
+
     # coverage
     cov = summary.get("coverage", {})
     p.append("<h2>Coverage</h2><div class='scroll'><table>")

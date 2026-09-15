@@ -2225,7 +2225,7 @@ def build_summary(st, args, extra, solver_names_map=None):
     if st["api_check"]:
         cov["v2 API match/mismatch/unavailable"] = (
             f"{st['api_check']['match']}/{st['api_check']['mismatch']}/{st['api_check']['unavailable']}")
-    return {
+    summary = {
         "version": VERSION, "chain": args.chain, "env": args.env, "native": nat,
         "from_block": st["from_block"], "to_block": st["to_block"],
         "coverage": cov,
@@ -2247,6 +2247,10 @@ def build_summary(st, args, extra, solver_names_map=None):
                                           key=lambda kv: -kv[1]["surplus_wei"])[:10]],
         "caveats": CAVEATS,
     }
+    # Additive (2026-09-16): present ONLY when --maker-metrics-db ran, so every existing field is untouched.
+    if extra.get("maker_metrics") is not None:
+        summary["maker_metrics"] = extra["maker_metrics"]
+    return summary
 
 
 # ---------------------------------------------------------------------- CLI
@@ -2338,6 +2342,14 @@ def build_parser():
                     help="continuous mode: rescan every N seconds from the last block")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress progress output (scorecard still prints to stdout)")
+    ap.add_argument("--maker-metrics-db", default=None, metavar="SQLITE",
+                    help="ADDITIVE maker-facing request metrics section (requests/quotes/bids/wins/fills/req-per-fill/"
+                         "no-stream per maker x pair x lane, weekly) from the engine's intelligence SQLite; absent = "
+                         "the report is unchanged")
+    ap.add_argument("--maker-metrics-logscan", default=None, metavar="JSON",
+                    help="optional cached log scan (bebop_request_discipline.py) for the quote lane + no-stream shares")
+    ap.add_argument("--maker-metrics-weeks", type=int, default=4, help="ISO weeks back (default 4)")
+    ap.add_argument("--maker-metrics-maker", default="bebop", help="maker/backend name (default bebop)")
     ap.add_argument("--version", action="version", version=f"cow-backtester {VERSION}")
     return ap
 
@@ -2484,6 +2496,13 @@ def main(argv=None):
                 say("  --readiness needs at least one --solver-url; "
                     "printing the field scorecard instead.")
             extra = print_scorecard(st, args, cache, solver_names_map)
+        if getattr(args, "maker_metrics_db", None):
+            from . import maker_metrics
+            extra = dict(extra or {})
+            extra["maker_metrics"] = maker_metrics.compute(
+                args.maker_metrics_db, weeks=args.maker_metrics_weeks, maker=args.maker_metrics_maker,
+                logscan_path=args.maker_metrics_logscan)
+            say(maker_metrics.render_text(extra["maker_metrics"]))
 
         if args.html_out:
             from . import report

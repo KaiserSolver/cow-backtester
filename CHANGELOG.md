@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Maker-facing request metrics (additive, opt-in).** `--maker-metrics-db <intel sqlite>` adds a `maker_metrics`
+  section — requests, quotes, bids, wins, fills, requests-per-fill and no-stream share per maker × pair × lane, per
+  ISO week — to the summary, the HTML report and the terminal. With `--maker-metrics-logscan` the quote lane and the
+  no-stream shares come from the engine's cached log scan. Without the flag nothing changes: no new field, no new
+  output (pinned by `tests/test_maker_metrics.py`). Not released.
+
 ## 0.11.1 — 2026-09-15
 
 A winner-surplus sanity check, two readiness readings the sum-weighted
