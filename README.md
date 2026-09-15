@@ -111,6 +111,18 @@ Twenty-nine auctions is a smoke test, not evidence: the verdict is held at REVIE
 500-auction floor no matter how the checks read, and the header says so. The full-window
 reports, run past the floor on all three chains the same day, are the three files linked above.
 
+Two readings the sum-weighted capture hides (0.11.1). When one auction's decoded
+winner surplus exceeds 100× the rest of the window combined it is a reference-price
+valuation artefact, not delivered value (BNB auction 25459284 decoded to 154,228 BNB
+and alone read the chain's capture as 0 %): it is listed with its ratio under a
+warn-level `winner surplus plausible` check, an `ex-artefact capture` line prints
+under `surplus vs winners`, and the `competitive vs winners` verdict reads the
+ex-artefact figure with both numbers shown; the rule needs 20 attempted auctions. A
+`per-bid median` line gives ours ÷ the winner's surplus at the median over the
+unflagged auctions we bid on — a solver can match winners bid for bid and still capture
+little when it never enters the largest auctions. In the readiness dict:
+`artefact_auctions`, `capture_ex_artefact_pct`, `per_bid_median_ratio`.
+
 It prints the exact `--from-block/--to-block` command to reproduce the run,
 and the same data lands in `--json-out`/`--html-out` under `readiness`
 (including `unscanned_blocks` and every skip reason). `--fail-on not-ready`
@@ -295,8 +307,12 @@ says which pair. That took minutes to learn here; it took weeks from logs.
 
 `--json-out` streams one row per auction (block, timestamp, age, winner txs +
 submitters + surplus/fees, per-solver validation detail and latency,
-`expired_orders_pct`, flags). `--html-out` writes a single self-contained HTML
-report: no external assets, light/dark aware, fine to attach to a PR or post.
+`expired_orders_pct`, flags). Under `--watch` the file is appended to, so a
+restart continues the same JSON Lines file (one `_meta` line per cycle; the
+first cycle after a restart re-scans `--blocks` from head, so dedupe by
+`auction_id` when summing); a one-shot run overwrites it. `--html-out` writes a
+single self-contained HTML report: no external assets, light/dark aware, fine
+to attach to a PR or post.
 
 ## Flags
 
@@ -327,7 +343,7 @@ report: no external assets, light/dark aware, fine to attach to a PR or post.
 | `--fail-on not-ready\|review` | with `--readiness`: exit 4 when a verdict trips — a CI gate |
 | `--clamp-validto` | extend expired `validTo` so engines that filter them still solve |
 | `--max-age-hours H` | warn when replayed auctions are older than this |
-| `--watch N` | continuous mode: rescan every N seconds from the last block |
+| `--watch N` | continuous mode: rescan every N seconds from the last block; `--json-out` appends across restarts |
 | `--quiet` | suppress progress (stderr); the scorecard and the readiness screen still print to stdout |
 | `--version` | print version |
 
@@ -343,8 +359,10 @@ shared deadline, so each endpoint gets the same inputs and the same wall-clock
 budget. Any HTTP 200 that is not `{"solutions": [...]}` is an error
 (`bad_schema`), never a healthy abstention; `{"solutions": []}` is the only
 legitimate empty answer. The JSONL `_meta` line carries `failed_ranges`,
-`unscanned_blocks`, `competition_missing` and `validto_clamped_auctions` so a
-pipeline inherits the run's coverage caveats.
+`unscanned_blocks`, `competition_missing`, `validto_clamped_auctions` and
+`winner_surplus_artefacts` (rows are streamed before the window total is known,
+so the artefact flag lives here — join on `auction_id`) so a pipeline inherits
+the run's coverage caveats.
 
 ## Caching
 

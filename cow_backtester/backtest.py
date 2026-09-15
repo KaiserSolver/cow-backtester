@@ -192,6 +192,19 @@ THRESHOLDS = {
     },
 }
 
+# Winner-surplus sanity check (v0.11.1). A decoded winner surplus larger than
+# ARTEFACT_RATIO x the winner surplus of EVERY OTHER attempted auction in the
+# window combined is a valuation artefact of the auction's reference prices,
+# not delivered value — observed on BNB auction 25459284, a 2 USDC -> MCH sell
+# order whose referencePrice valued the tokens received at ~251,000 BNB
+# (6,003x the rest of a 2,595-auction window; the sum-weighted capture read
+# 0.0 %). Such an auction is listed with its ratio, excluded from the capture
+# the 'competitive vs winners' verdict reads (both figures print), and marked
+# in the JSON. The rule needs ARTEFACT_MIN_ATTEMPTED attempted auctions before
+# it may fire — a thin window has no "rest" to measure against.
+ARTEFACT_RATIO = 100
+ARTEFACT_MIN_ATTEMPTED = 20
+
 # Driver-side labels for the per-reason error dict (autopilot's
 # `solutions{solver,result}` vocabulary) so a reader can line the replay's
 # failures up with what the protocol would have recorded.
@@ -1494,6 +1507,75 @@ def _pct(a, b):
     return None if not b else 100 * a / b
 
 
+def solver_ledger(rows, name):
+    """Per-auction view of the sums process_window accrues for one solver:
+    one entry per auction the solver was SENT (answered or not), carrying the
+    decoded winner surplus and the solver's row result (v0.11.1)."""
+    out = []
+    for row in rows or []:
+        vs = (row.get("solvers") or {}).get(name)
+        if vs is None:
+            continue
+        out.append({"auction_id": row.get("auction_id"),
+                    "winner_surplus_wei": int(row.get("winner_surplus_wei") or 0),
+                    "winner_reference_score": row.get("winner_reference_score"),
+                    "vs": vs})
+    return out
+
+
+def winner_surplus_artefacts(entries):
+    """BT-10: auctions whose decoded winner surplus exceeds ARTEFACT_RATIO x the
+    rest of the attempted window's winner surplus combined — a reference-price
+    valuation artefact, not delivered value. `entries` are solver_ledger()
+    dicts (anything with auction_id / winner_surplus_wei works). Returns
+    [{auction_id, winner_surplus_wei, rest_wei, ratio, our_surplus_wei,
+    answered, winner_reference_score}] by descending ratio; [] below
+    ARTEFACT_MIN_ATTEMPTED entries, or when the rest of the window has no
+    surplus to measure against. By construction at most one auction can
+    satisfy the rule (two would need more than the whole window between
+    them), so two artefacts of similar size mask each other — the listing is
+    a list for JSON stability, not because several can appear."""
+    if len(entries) < ARTEFACT_MIN_ATTEMPTED:
+        return []
+    total = sum(e["winner_surplus_wei"] for e in entries)
+    out = []
+    for e in entries:
+        w = e["winner_surplus_wei"]
+        rest = total - w
+        if rest > 0 and w > ARTEFACT_RATIO * rest:
+            vs = e.get("vs") or {}
+            out.append({"auction_id": e["auction_id"], "winner_surplus_wei": w,
+                        "rest_wei": rest, "ratio": round(w / rest, 1),
+                        "our_surplus_wei": int(vs.get("best_surplus_wei") or 0),
+                        "answered": "n_solutions" in vs,
+                        "winner_reference_score": e.get("winner_reference_score")})
+    return sorted(out, key=lambda a: -a["ratio"])
+
+
+def per_bid_ratios(entries, exclude_ids=()):
+    """BT-12: our best valid surplus / the winner's surplus on every UNFLAGGED
+    bid auction — answered with >= 1 solution, not flagged implausible_surplus,
+    not a winner-surplus artefact, winner surplus > 0 (a zero winner has no
+    ratio; a bid with no valid solution counts as 0). Their median is the
+    per-bid read the sum-weighted capture hides: a solver can match the
+    winners bid for bid and still capture little when it never enters the
+    largest auctions."""
+    out = []
+    for e in entries:
+        vs = e.get("vs") or {}
+        if e["auction_id"] in exclude_ids or not vs.get("n_solutions"):
+            continue
+        if "implausible_surplus" in (vs.get("flags") or []) or e["winner_surplus_wei"] <= 0:
+            continue
+        out.append(int(vs.get("best_surplus_wei") or 0) / e["winner_surplus_wei"])
+    return out
+
+
+PER_BID_RATIO_BASIS = ("median over answered auctions with >= 1 solution of (best valid surplus / "
+                       "winner surplus); implausible_surplus rows, winner-surplus artefacts and "
+                       "zero-winner auctions excluded")
+
+
 def readiness_report(st, args):
     """A one-screen pre-production readiness check for a single solver endpoint:
     did it answer, how fast, and were its solutions sane against the winners?
@@ -1504,7 +1586,13 @@ def readiness_report(st, args):
     of `default`), the budget from BUDGETS_S / --solve-timeout (never an
     assumed constant), failures follow the driver's taxonomy (deadline miss vs
     transport), a capped or thin sample cannot be READY, and the header says
-    exactly which window, budget and thresholds produced the verdict."""
+    exactly which window, budget and thresholds produced the verdict.
+
+    v0.11.1: a winner-surplus valuation artefact (> ARTEFACT_RATIO x the rest
+    of the attempted window) is listed and excluded from the capture the
+    'competitive vs winners' verdict reads — both figures print — and the
+    per-bid median ratio (ours / winner over unflagged bid auctions) prints
+    next to the sum-weighted capture."""
     reports = []
     chain = getattr(args, "chain", None)
     env = getattr(args, "env", None)
@@ -1517,6 +1605,7 @@ def readiness_report(st, args):
     budget_ms = budget_s * 1000
     thr, profile, thr_src = resolve_thresholds(chain, getattr(args, "min_evidence", None))
     min_evidence = thr["min_evidence"]
+    nat = st.get("native") or CHAINS.get(chain, {}).get("native", "ETH")
     cap = int(getattr(args, "max_auctions", 0) or 0)
 
     # window disclosure (shared by every solver in the run)
@@ -1567,6 +1656,25 @@ def readiness_report(st, args):
         capture_cond = _pct(s["our_surplus"], s["winner_surplus"])
         capture = capture_adj
         basis_mix = dict(s.get("basis_mix") or {})
+        # v0.11.1 (BT-10/12): the per-auction ledger behind those sums. A
+        # winner-surplus valuation artefact is listed and the capture the
+        # verdict reads excludes it (both figures print); the per-bid median
+        # ratio says how we do on the auctions we actually enter.
+        ledger = solver_ledger(st.get("rows"), sv["name"])
+        artefacts = winner_surplus_artefacts(ledger)
+        art_ids = {a["auction_id"] for a in artefacts}
+        if artefacts:
+            art_ours = sum(a["our_surplus_wei"] for a in artefacts)
+            capture_ex = _pct(s["our_surplus"] - art_ours,
+                              (s.get("winner_surplus_attempted") or s["winner_surplus"])
+                              - sum(a["winner_surplus_wei"] for a in artefacts))
+            capture_cond_ex = _pct(s["our_surplus"] - art_ours,
+                                   s["winner_surplus"]
+                                   - sum(a["winner_surplus_wei"] for a in artefacts if a["answered"]))
+        else:
+            capture_ex, capture_cond_ex = capture, capture_cond     # nothing excluded
+        bid_ratios = per_bid_ratios(ledger, art_ids)
+        per_bid_median = statistics.median(bid_ratios) if bid_ratios else None
         fe, fne = s.get("fairness_evaluated", 0), s.get("fairness_not_evaluated", 0)
         if fe and not fne:
             validity_basis = "feasibility+eligibility+udcp+fairness"
@@ -1618,11 +1726,16 @@ def readiness_report(st, args):
                      f"udcp {s.get('udcp_checked', 0)} checked / "
                      f"{s.get('udcp_violations', 0)} violations]")
                     if valid_rate is not None else "n/a")
-                chk((capture or 0) >= thr["capture_pass"], (capture or 0) > thr["capture_warn"],
+                # the verdict reads the ex-artefact capture (the headline
+                # itself when no artefact was found); both numbers print
+                chk((capture_ex or 0) >= thr["capture_pass"], (capture_ex or 0) > thr["capture_warn"],
                     "competitive vs winners",
-                    (f"{capture:.0f}% of winner surplus captured (coverage-adjusted; "
-                     f"{capture_cond:.0f}% conditional on answering; basis mix {basis_mix})")
-                    if capture is not None and capture_cond is not None else "n/a")
+                    (f"{capture_ex:.0f}% of winner surplus captured (coverage-adjusted; "
+                     f"{capture_cond_ex:.0f}% conditional on answering; basis mix {basis_mix})"
+                     + (f"; {len(artefacts)} valuation artefact(s) excluded — "
+                        f"{capture:.0f}% / {capture_cond:.0f}% including them"
+                        if artefacts and capture is not None and capture_cond is not None else ""))
+                    if capture_ex is not None and capture_cond_ex is not None else "n/a")
             elif s["replayed"]:
                 # Healthy endpoint that never bid: nothing to assess — that is
                 # a strategy fact, not an endpoint failure, but it also cannot
@@ -1632,6 +1745,20 @@ def readiness_report(st, args):
             if s["implausible"]:
                 chk(False, True, "prices look plausible",
                     f"{s['implausible']} auction(s) flagged implausible_surplus")
+            if artefacts:
+                # A reference-price artefact in the WINNER data (the mirror of
+                # 'prices look plausible', which is about ours). The verdict
+                # already reads the ex-artefact capture; this row makes sure a
+                # human sees what was excluded, so the window is REVIEW at best.
+                chk(False, True, "winner surplus plausible",
+                    f"{len(artefacts)} auction(s) excluded from the capture verdict as valuation "
+                    f"artefact(s) — " + "; ".join(
+                        f"auction {a['auction_id']}: {_fmt_native(a['winner_surplus_wei'])} {nat} "
+                        f"winner surplus, {a['ratio']:g}x the rest of the attempted window combined"
+                        + (f" (competition referenceScore {a['winner_reference_score']})"
+                           if a.get("winner_reference_score") is not None else "")
+                        for a in artefacts)
+                    + f" [rule: > {ARTEFACT_RATIO}x the rest, >= {ARTEFACT_MIN_ATTEMPTED} attempted]")
             # Coverage disclosure: a verdict against a partial field is only
             # meaningful if the reader can see how partial. Never a hard fail
             # (it's environmental, not the solver's doing) — but excluded
@@ -1693,6 +1820,15 @@ def readiness_report(st, args):
             "transport_rate_pct": transport_rate, "deadline_miss_rate_pct": dmiss_rate,
             "errors": errors,
             "capture_pct": capture, "capture_conditional_pct": capture_cond,
+            "capture_ex_artefact_pct": capture_ex,
+            "capture_conditional_ex_artefact_pct": capture_cond_ex,
+            "artefact_auctions": artefacts,
+            "artefact_rule": {"ratio": ARTEFACT_RATIO, "min_attempted": ARTEFACT_MIN_ATTEMPTED,
+                              "evaluated": len(ledger) >= ARTEFACT_MIN_ATTEMPTED,
+                              "basis": ("winner_surplus_wei > ratio x the rest of the attempted "
+                                        "window's winner surplus combined")},
+            "per_bid_median_ratio": per_bid_median, "per_bid_ratio_n": len(bid_ratios),
+            "per_bid_ratio_basis": PER_BID_RATIO_BASIS,
             "basis_mix": basis_mix,
             "p50_ms": p50, "p95_ms": p95, "max_ms": pmax,
             "latency_basis": ("answered auctions only, late answers included; a dead "
@@ -1771,6 +1907,15 @@ def readiness_report(st, args):
             print(f"  surplus vs winners  : {capture:.0f}% captured (coverage-adjusted)"
                   + (f" / {capture_cond:.0f}% conditional" if capture_cond is not None else "")
                   + f"   ({s['valid']}/{s['replayed']} valid)")
+        if artefacts and capture_ex is not None:
+            print(f"  ex-artefact capture : {capture_ex:.0f}% captured (coverage-adjusted)"
+                  + (f" / {capture_cond_ex:.0f}% conditional" if capture_cond_ex is not None else "")
+                  + f"   excluding {len(artefacts)} auction(s): "
+                  + ", ".join(f"{a['auction_id']} ({a['ratio']:g}x the rest)" for a in artefacts))
+        if ledger:
+            print("  per-bid median      : "
+                  + (f"{per_bid_median:.3f}x ours/winner over {len(bid_ratios)} unflagged bid auction(s)"
+                     if per_bid_median is not None else "n/a (no unflagged bid auctions)"))
         if basis_mix:
             print(f"  winner basis mix    : {basis_mix}")
         print(f"  validity basis      : {validity_basis}")
@@ -2250,8 +2395,23 @@ def main(argv=None):
 
     jout = None
     if args.json_out:
+        # v0.11.1: under --watch the file is APPENDED to, so a restart continues
+        # the same JSON Lines file instead of truncating the previous run (one
+        # _meta line per cycle marks the window boundaries; the first cycle
+        # after a restart re-scans --blocks from head, so consumers dedupe by
+        # auction_id). A one-shot run still starts a fresh file.
+        mode = "a" if args.watch else "w"
         try:
-            jout = open(args.json_out, "w")
+            needs_newline = False
+            if mode == "a" and os.path.exists(args.json_out) and os.path.getsize(args.json_out) > 0:
+                # a previous run killed mid-line must not get our first row
+                # glued onto its partial last line
+                with open(args.json_out, "rb") as f:
+                    f.seek(-1, os.SEEK_END)
+                    needs_newline = f.read(1) != b"\n"
+            jout = open(args.json_out, mode)
+            if needs_newline:
+                jout.write("\n")
         except OSError as e:
             print(f"ERROR: cannot write --json-out {args.json_out}: {e}", file=sys.stderr)
             sys.exit(1)
@@ -2348,9 +2508,18 @@ def main(argv=None):
                 "unscanned_blocks": sum(hi - lo + 1 for lo, hi in st["failed_ranges"]),
                 "competition_missing": st["agg"].get("competition_missing", 0),
                 "validto_clamped_auctions": st["agg"].get("validto_clamped_auctions", 0),
+                # v0.11.1: rows are streamed before the window total is known,
+                # so the per-row line cannot carry the artefact flag — join on
+                # auction_id (readiness.artefact_auctions has the full detail)
+                "winner_surplus_artefacts": [
+                    {k: a[k] for k in ("auction_id", "winner_surplus_wei", "ratio")}
+                    for a in winner_surplus_artefacts(
+                        [{"auction_id": r["auction_id"], "winner_surplus_wei": r["winner_surplus_wei"]}
+                         for r in st["rows"]])],
                 "caveats": CAVEATS}}) + "\n")
             jout.flush()
-            say(f"  wrote {len(st['rows'])} rows + 1 _meta line -> {args.json_out}")
+            say(f"  {'appended' if args.watch else 'wrote'} {len(st['rows'])} rows + 1 _meta line "
+                f"-> {args.json_out}")
 
         last_to = to
         cycle += 1

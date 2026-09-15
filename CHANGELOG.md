@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.11.1 — 2026-09-15
+
+A winner-surplus sanity check, two readiness readings the sum-weighted
+capture was hiding, and a `--watch` file-handling fix. Prompted by the BNB
+report of 2026-09-14 (`docs/readiness/kaisersolver-bnb-2026-09-14.md`),
+whose 0.0 % capture was one auction.
+
+- **A valuation artefact in the winner data no longer decides the verdict.**
+  BNB auction 25459284 — a 2 USDC → MCH sell order whose `referencePrice`
+  valued the MCH received at ≈251,000 BNB against 0.0028 BNB sold — decoded
+  to a winner surplus of 154,228 BNB, 6,003× the rest of a 2,595-auction
+  window combined, and alone turned the chain's capture from 5.65 % into
+  0.00 % and `competitive vs winners` into a WARN. `--readiness` now flags an
+  attempted auction whose decoded winner surplus exceeds `ARTEFACT_RATIO`
+  (100)× the winner surplus of every other attempted auction combined, once
+  at least `ARTEFACT_MIN_ATTEMPTED` (20) auctions were attempted; both
+  constants live next to `THRESHOLDS`, and a window whose other auctions
+  carry no surplus has nothing to measure against, so nothing fires. Such an
+  auction is listed with its ratio (and the competition `referenceScore`
+  when `--compete` fetched it) on a warn-level `winner surplus plausible`
+  check — the mirror of `prices look plausible`, which is about the
+  challenger's prices — so the window is REVIEW at best and a human sees
+  what was excluded. Capture prints both ways: an `ex-artefact capture`
+  line under `surplus vs winners`, and the `competitive vs winners` detail
+  carries the including-figures; its verdict reads the ex-artefact capture.
+  The auction leaves both sides (our surplus on it is valued at the same
+  bogus price). JSON: `capture_ex_artefact_pct`,
+  `capture_conditional_ex_artefact_pct`, `artefact_auctions` (`auction_id`,
+  `winner_surplus_wei`, `rest_wei`, `ratio`, `our_surplus_wei`, `answered`,
+  `winner_reference_score`) and `artefact_rule` (the constants and whether
+  the rule could fire). The JSONL `_meta` line carries
+  `winner_surplus_artefacts` (`auction_id`, `winner_surplus_wei`, `ratio`):
+  rows are streamed before the window total is known, so the per-row line
+  cannot carry the flag — join on `auction_id`. With no artefact every
+  number, line and check is unchanged. The rule is single-pass (each auction
+  against all the others), so at most one auction can ever satisfy it; two
+  artefacts of similar size would mask each other.
+- **Per-bid median ratio.** A `per-bid median` line prints the median of
+  (our best valid surplus ÷ the winner's surplus) over the unflagged bid
+  auctions — answered with ≥ 1 solution, not `implausible_surplus`, not an
+  artefact, winner surplus > 0 (a bid with no valid solution counts as 0) —
+  next to the sum-weighted capture, because a solver can match the winners
+  bid for bid and still capture little when it never enters the largest
+  auctions. JSON: `per_bid_median_ratio`, `per_bid_ratio_n`,
+  `per_bid_ratio_basis`.
+- **`--json-out` appends under `--watch`.** The file was opened in `w` mode,
+  so a restarted watch run truncated the fixed file name (operators were
+  summing files to work around it). Under `--watch` it is now opened in
+  append mode — the same JSON Lines shape, rows plus one `_meta` line per
+  cycle — and a partial last line left by a killed run is terminated before
+  the first new row. Without `--watch` a run still starts a fresh file. The
+  first cycle after a restart re-scans `--blocks` from head, so dedupe by
+  `auction_id` when summing a file across restarts.
+
 ## 0.11.0 — 2026-09-14
 
 Readiness-standard batch. The 2026-09-14 audit (`readiness-inputs-report.md`)
