@@ -201,9 +201,18 @@ THRESHOLDS = {
 # 0.0 %). Such an auction is listed with its ratio, excluded from the capture
 # the 'competitive vs winners' verdict reads (both figures print), and marked
 # in the JSON. The rule needs ARTEFACT_MIN_ATTEMPTED attempted auctions before
-# it may fire — a thin window has no "rest" to measure against.
+# it may fire — a thin window has no "rest" to measure against. A cluster of
+# co-scaled artefacts is measured as a set against the window outside it (see
+# winner_surplus_artefacts); anything beyond a single outlier must also sit
+# ARTEFACT_GROUP_GAP x above the largest auction left below it. Ordinary order
+# sizes spread widely (a short Plasma window holds auctions of 1e10 and 1e18
+# wei side by side, which a 100x-the-rest test alone would call a cluster),
+# while a bogus reference price lands many orders of magnitude clear of all of
+# them (Plasma auctions 8939411, 8952964 and 9040629: ~7.4e32 wei each, 11
+# orders above the largest real auction in their window).
 ARTEFACT_RATIO = 100
 ARTEFACT_MIN_ATTEMPTED = 20
+ARTEFACT_GROUP_GAP = 10**9
 
 # Driver-side labels for the per-reason error dict (autopilot's
 # `solutions{solver,result}` vocabulary) so a reader can line the replay's
@@ -1531,24 +1540,43 @@ def winner_surplus_artefacts(entries):
     [{auction_id, winner_surplus_wei, rest_wei, ratio, our_surplus_wei,
     answered, winner_reference_score}] by descending ratio; [] below
     ARTEFACT_MIN_ATTEMPTED entries, or when the rest of the window has no
-    surplus to measure against. By construction at most one auction can
-    satisfy the rule (two would need more than the whole window between
-    them), so two artefacts of similar size mask each other — the listing is
-    a list for JSON stability, not because several can appear."""
+    surplus to measure against.
+
+    Artefacts can come in clusters (several auctions valued at the same bogus
+    reference price), and one-vs-rest cannot see a cluster: each member has
+    the others in its rest. So the rule is applied to the k largest auctions
+    as a set, and the LARGEST qualifying set is flagged. The k largest
+    qualify when they are a strict minority of the window and the smallest
+    of them exceeds ARTEFACT_RATIO x the window outside the set (`rest_wei`)
+    and, for k > 1, also ARTEFACT_GROUP_GAP x the largest auction outside it
+    — a dominant GROUP is also what a short window of ordinary auctions
+    beside dust looks like. k = 1 is the single-outlier rule unchanged.
+    Taking the largest set means a larger artefact cannot hide a cluster
+    below it, and a set that dominates but sits within the gap of the next
+    auction (one bad price on orders of different sizes) does not end the
+    search. Every listed auction exceeds ARTEFACT_RATIO x `rest_wei`."""
     if len(entries) < ARTEFACT_MIN_ATTEMPTED:
         return []
-    total = sum(e["winner_surplus_wei"] for e in entries)
+    ranked = sorted(entries, key=lambda e: -e["winner_surplus_wei"])
+    tail = sum(e["winner_surplus_wei"] for e in ranked)
+    n, rest = 0, tail                       # ranked[:n] are flagged
+    for i in range((len(ranked) - 1) // 2):
+        w = ranked[i]["winner_surplus_wei"]
+        tail -= w
+        # ranked descending: w is the smallest of the k = i + 1 largest, and
+        # ranked[i + 1] (i + 1 < len by the minority cap) the largest outside
+        if (tail > 0 and w > ARTEFACT_RATIO * tail
+                and (i == 0 or w > ARTEFACT_GROUP_GAP * ranked[i + 1]["winner_surplus_wei"])):
+            n, rest = i + 1, tail
     out = []
-    for e in entries:
+    for e in ranked[:n]:
         w = e["winner_surplus_wei"]
-        rest = total - w
-        if rest > 0 and w > ARTEFACT_RATIO * rest:
-            vs = e.get("vs") or {}
-            out.append({"auction_id": e["auction_id"], "winner_surplus_wei": w,
-                        "rest_wei": rest, "ratio": round(w / rest, 1),
-                        "our_surplus_wei": int(vs.get("best_surplus_wei") or 0),
-                        "answered": "n_solutions" in vs,
-                        "winner_reference_score": e.get("winner_reference_score")})
+        vs = e.get("vs") or {}
+        out.append({"auction_id": e["auction_id"], "winner_surplus_wei": w,
+                    "rest_wei": rest, "ratio": round(w / rest, 1),
+                    "our_surplus_wei": int(vs.get("best_surplus_wei") or 0),
+                    "answered": "n_solutions" in vs,
+                    "winner_reference_score": e.get("winner_reference_score")})
     return sorted(out, key=lambda a: -a["ratio"])
 
 
@@ -1589,7 +1617,8 @@ def readiness_report(st, args):
     exactly which window, budget and thresholds produced the verdict.
 
     v0.11.1: a winner-surplus valuation artefact (> ARTEFACT_RATIO x the rest
-    of the attempted window) is listed and excluded from the capture the
+    of the attempted window; a cluster of them is tested as a set, see
+    winner_surplus_artefacts) is listed and excluded from the capture the
     'competitive vs winners' verdict reads — both figures print — and the
     per-bid median ratio (ours / winner over unflagged bid auctions) prints
     next to the sum-weighted capture."""
@@ -1755,10 +1784,13 @@ def readiness_report(st, args):
                     f"artefact(s) — " + "; ".join(
                         f"auction {a['auction_id']}: {_fmt_native(a['winner_surplus_wei'])} {nat} "
                         f"winner surplus, {a['ratio']:g}x the rest of the attempted window combined"
+                        + (f" (outside the {len(artefacts)} flagged)" if len(artefacts) > 1 else "")
                         + (f" (competition referenceScore {a['winner_reference_score']})"
                            if a.get("winner_reference_score") is not None else "")
                         for a in artefacts)
-                    + f" [rule: > {ARTEFACT_RATIO}x the rest, >= {ARTEFACT_MIN_ATTEMPTED} attempted]")
+                    + f" [rule: > {ARTEFACT_RATIO}x the rest, >= {ARTEFACT_MIN_ATTEMPTED} attempted"
+                    + (f"; a group also > {ARTEFACT_GROUP_GAP:.0e}x the largest auction below it"
+                       if len(artefacts) > 1 else "") + "]")
             # Coverage disclosure: a verdict against a partial field is only
             # meaningful if the reader can see how partial. Never a hard fail
             # (it's environmental, not the solver's doing) — but excluded
@@ -1824,9 +1856,15 @@ def readiness_report(st, args):
             "capture_conditional_ex_artefact_pct": capture_cond_ex,
             "artefact_auctions": artefacts,
             "artefact_rule": {"ratio": ARTEFACT_RATIO, "min_attempted": ARTEFACT_MIN_ATTEMPTED,
+                              "group_gap": ARTEFACT_GROUP_GAP,
                               "evaluated": len(ledger) >= ARTEFACT_MIN_ATTEMPTED,
                               "basis": ("winner_surplus_wei > ratio x the rest of the attempted "
-                                        "window's winner surplus combined")},
+                                        "window's winner surplus combined, the rest being the "
+                                        "window outside every flagged auction; the largest "
+                                        "qualifying set of the k largest is flagged; for k > 1 "
+                                        "the smallest flagged auction must also exceed "
+                                        "group_gap x the largest auction outside the set; flagged "
+                                        "auctions are a strict minority of the window")},
             "per_bid_median_ratio": per_bid_median, "per_bid_ratio_n": len(bid_ratios),
             "per_bid_ratio_basis": PER_BID_RATIO_BASIS,
             "basis_mix": basis_mix,
