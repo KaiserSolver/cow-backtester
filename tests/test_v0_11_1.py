@@ -163,9 +163,90 @@ def test_artefact_rule_boundaries():
     # a window whose other auctions carry NO surplus has nothing to measure
     # against: the only auction with surplus is not an artefact
     assert flagged(entries(10**30, 19, rest_each=0)) == []
-    # at most one auction can satisfy the rule; two of similar size mask each
-    # other (documented limitation of the single-pass rule)
-    assert flagged(entries(10**30, 19) + [{"auction_id": 98, "winner_surplus_wei": 10**30}]) == []
+    # two of similar size no longer mask each other: both leave the window
+    assert flagged(entries(10**30, 19) + [{"auction_id": 98, "winner_surplus_wei": 10**30}]) == [99, 98]
+    # beyond a single outlier, the set must also sit more than ARTEFACT_GROUP_GAP
+    # x above the largest auction left below it: exactly 1e9x is NOT an artefact
+    pair = [{"auction_id": 98, "winner_surplus_wei": 10**9 * 1000}]
+    assert flagged(entries(10**9 * 1000, 19) + pair) == []
+    pair[0]["winner_surplus_wei"] += 1
+    assert flagged(entries(10**9 * 1000 + 1, 19) + pair) == [99, 98]
+    # a single outlier still fires alone, without dragging a large-but-ordinary
+    # auction in after it
+    assert flagged(entries(10**30, 18) + [{"auction_id": 98, "winner_surplus_wei": 10**6}]) == [99]
+    # a cluster must be a strict minority of the window: 10 of 21 is a
+    # cluster, 10 of 20 is half the window
+    big = [{"auction_id": 100 + i, "winner_surplus_wei": 10**30} for i in range(9)]
+    assert flagged(entries(10**30, 11) + big) == [99] + [100 + i for i in range(9)]
+    assert flagged(entries(10**30, 10) + big) == []
+    # a larger artefact above a cluster must not hide it: the search runs again
+    # on what is left, and every flagged auction is measured against the window
+    # outside ALL of them
+    ordinary = [{"auction_id": i, "winner_surplus_wei": 1000} for i in range(1, 24)]
+    nested = ([{"auction_id": 97, "winner_surplus_wei": 10**40}]
+              + [{"auction_id": 100 + i, "winner_surplus_wei": 7 * 10**32} for i in range(3)])
+    assert flagged(ordinary + nested) == [97, 100, 101, 102]
+    assert {a["rest_wei"] for a in backtest.winner_surplus_artefacts(ordinary + nested)} == {23_000}
+    # the minority cap holds across rounds, not per round: 1 + 9 of 21 is a
+    # minority, 1 + 9 of 20 is not (the 9 then stay in the window)
+    nine = [{"auction_id": 100 + i, "winner_surplus_wei": 10**30} for i in range(9)]
+    top = [{"auction_id": 97, "winner_surplus_wei": 10**40}]
+    assert flagged(ordinary[:11] + top + nine) == [97] + [100 + i for i in range(9)]
+    assert flagged(ordinary[:10] + top + nine) == [97]
+    # one bad price on orders of different sizes: the largest two dominate the
+    # window first but sit within the gap of the third, so the search must go
+    # on to the set of three rather than give up
+    whales = [{"auction_id": i, "winner_surplus_wei": 10**18} for i in range(1, 24)]
+    for third in (7 * 10**30, 7 * 10**28):
+        tiered = [{"auction_id": 100, "winner_surplus_wei": 74 * 10**31},
+                  {"auction_id": 101, "winner_surplus_wei": 73 * 10**31},
+                  {"auction_id": 102, "winner_surplus_wei": third}]
+        assert flagged(whales + tiered) == [100, 101, 102]
+
+
+def test_two_population_window_flags_nothing():
+    """A short window of ordinary auctions (5e17-2.4e18 wei) beside dust
+    (1e10-3e10 wei): every ordinary auction is far more than 100x all the dust
+    combined, but seven orders of magnitude is a real spread of order sizes,
+    not a valuation artefact. Flagging the ordinary auctions as a group would
+    leave the ex-artefact capture measured over dust alone."""
+    rows = ([_row(1 + i, (5 + i) * 10**17, (3 + i) * 10**17) for i in range(20)]
+            + [_row(100 + i, (1 + i % 3) * 10**10, ours=None) for i in range(30)])
+    rep = backtest.readiness_report(_state(rows), _args())[0]
+    assert rep["artefact_auctions"] == [] and rep["artefact_rule"]["evaluated"] is True
+    assert rep["capture_ex_artefact_pct"] == rep["capture_pct"]
+    assert "winner surplus plausible" not in _checks(rep)
+
+
+@pytest.mark.parametrize("above", [{}, {ARTEFACT_ID: 10**40}], ids=["alone", "under-a-larger-artefact"])
+def test_cluster_of_co_scaled_artefacts_is_listed_and_excluded(above):
+    """Plasma, three auctions (8939411, 8952964, 9040629) whose buy token's
+    referencePrice (~5.0e37) valued each winner surplus at ~7.4e32 wei. None is
+    100x the other two combined, so a one-vs-rest rule lists nothing and the
+    capture reads 0 %; cleaned, the window reads what the solver does. The
+    rows carry the decoded per-auction winner surplus, which is all the rule
+    reads. A second, larger artefact from another token in the same window must
+    not hide the cluster either."""
+    cluster = {8939411: 740 * 10**30, 8952964: 738 * 10**30, 9040629: 743 * 10**30, **above}
+    rows = _normal_rows(23) + [_row(aid, w, ours=None) for aid, w in cluster.items()]
+    rep = backtest.readiness_report(_state(rows), _args())[0]
+    assert {a["auction_id"] for a in rep["artefact_auctions"]} == set(cluster)
+    for a in rep["artefact_auctions"]:
+        assert a["winner_surplus_wei"] == cluster[a["auction_id"]]
+        assert a["rest_wei"] == 23_000                  # the window outside the cluster
+    assert rep["capture_pct"] == pytest.approx(0.0, abs=1e-20)
+    assert rep["capture_ex_artefact_pct"] == pytest.approx(60.0)
+    assert rep["capture_conditional_ex_artefact_pct"] == pytest.approx(60.0)
+    assert _checks(rep)["competitive vs winners"]["level"] == "ok"
+    w = _checks(rep)["winner surplus plausible"]
+    assert w["level"] == "warn" and w["detail"].startswith(f"{len(cluster)} auction(s) excluded")
+    assert all(str(aid) in w["detail"] for aid in cluster)
+    assert f"the rest of the attempted window combined (outside the {len(cluster)} flagged)" in w["detail"]
+    assert "[rule: > 100x the rest, >= 20 attempted; a group also > 1e+09x the largest auction below it]" \
+        in w["detail"]
+    assert rep["artefact_rule"]["group_gap"] == 10**9
+    assert rep["verdict"] == "REVIEW"
+    assert rep["per_bid_ratio_n"] == 23 and rep["per_bid_median_ratio"] == pytest.approx(0.6)
 
 
 def test_thin_window_cannot_flag_an_artefact():
