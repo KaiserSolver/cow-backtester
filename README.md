@@ -51,12 +51,12 @@ API (`POST /solve`).
 If you are bringing up a new solver and want a fast "is this endpoint healthy
 enough to face production auctions?" read, `--readiness` prints a one-screen
 report instead of the full field scorecard. We hold ourselves to it: our own
-solvers' reports, run past the 500-auction floor with 0.11.0 on 2026-09-14, are
-committed under `docs/readiness/` —
-[Arbitrum](docs/readiness/kaisersolver-arbitrum-one-2026-09-14.md),
-[Base](docs/readiness/kaisersolver-base-2026-09-14.md),
-[BNB](docs/readiness/kaisersolver-bnb-2026-09-14.md) (the 2026-08-22 Base report is
-kept there, marked superseded by the 0.11.0 method).
+solvers' reports, run past the 500-auction floor with 0.11.0 on 2026-09-14, were
+kept under `docs/readiness/` here until 2026-09-21 and now live in a separate,
+checksummed record of their own (`KaiserSolver/kaisersolver-readiness`). This
+repository ships the tool; that one is one solver's record of applying it to
+itself. The versions cited on the forum remain in this repository's history at
+commit `e7b3b73` (`git show e7b3b73:docs/readiness/kaisersolver-base-2026-09-14.md`).
 
 ```bash
 cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc> \

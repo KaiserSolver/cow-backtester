@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Our own readiness reports moved out.** `docs/readiness/` is gone from this repository. The
+  reports (2026-08-22 and the three of 2026-09-14, byte-identical) and every future run live in a
+  checksummed record of their own, `KaiserSolver/kaisersolver-readiness`, each with its SHA-256 and
+  the fingerprints of the rows it was built from. The tool is for any solver; one solver's record does
+  not belong in its checkout. The versions cited on the forum remain at commit `e7b3b73`.
+
 ## 0.11.1 — 2026-09-15
 
 A winner-surplus sanity check, two readiness readings the sum-weighted
