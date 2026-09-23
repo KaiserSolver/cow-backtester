@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **A cluster of valuation artefacts is caught, not only a single outlier.** The 0.11.1
+  `winner surplus plausible` rule tested each attempted auction against the rest of the window
+  combined, so at most one auction could fire and co-scaled artefacts masked each other. Plasma
+  auctions 8939411, 8952964 and 9040629, whose buy token's `referencePrice` (≈5.0e37) valued each
+  winner surplus at ≈7.4e32 wei, each sat at ≈0.5× the other two: nothing fired, and the sum-weighted
+  capture read ≈0 % for every solver. The rule now tests the k largest auctions as a set and flags the
+  largest set that qualifies: a strict minority of the window whose smallest member exceeds
+  `ARTEFACT_RATIO` (100)× the window outside the set and, for k > 1, also `ARTEFACT_GROUP_GAP` (10⁹,
+  next to the other two constants)× the largest auction outside it. The gap keeps a short window of
+  ordinary auctions beside dust from reading as a cluster, since real order sizes spread across
+  seven orders of magnitude. k = 1 is the 0.11.1 rule unchanged: clean and single-outlier windows
+  print byte-identical output. `rest_wei` is now the window outside every flagged auction; flagged
+  auctions are still listed with their ratio, never dropped. JSON: `artefact_rule` gains `group_gap`
+  and a longer `basis`. Found running the tool on Plasma, reported and fixed by
+  [@C-09-07](https://github.com/C-09-07) in [#1](https://github.com/KaiserSolver/cow-backtester/pull/1).
 - **Our own readiness reports moved out.** `docs/readiness/` is gone from this repository. The
   reports (2026-08-22 and the three of 2026-09-14, byte-identical) and every future run live in a
   checksummed record of their own, `KaiserSolver/kaisersolver-readiness`, each with its SHA-256 and
