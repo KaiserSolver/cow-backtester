@@ -114,8 +114,11 @@ reports, run past the floor on all three chains the same day, are the three file
 Two readings the sum-weighted capture hides (0.11.1). When one auction's decoded
 winner surplus exceeds 100× the rest of the window combined it is a reference-price
 valuation artefact, not delivered value (BNB auction 25459284 decoded to 154,228 BNB
-and alone read the chain's capture as 0 %): it is listed with its ratio under a
-warn-level `winner surplus plausible` check, an `ex-artefact capture` line prints
+and alone read the chain's capture as 0 %). Several auctions valued at the same bogus
+price are tested as a set: a minority of the window whose smallest member exceeds 100×
+the window outside the set and 10⁹× the largest auction outside it (three Plasma
+auctions at ≈7.4e32 wei each hid one another from a one-vs-rest test). Each flagged
+auction is listed with its ratio under a warn-level `winner surplus plausible` check, an `ex-artefact capture` line prints
 under `surplus vs winners`, and the `competitive vs winners` verdict reads the
 ex-artefact figure with both numbers shown; the rule needs 20 attempted auctions. A
 `per-bid median` line gives ours ÷ the winner's surplus at the median over the
