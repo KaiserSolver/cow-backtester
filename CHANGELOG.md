@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.11.2 — 2026-09-23
+
+A fix to the 0.11.1 winner-surplus sanity check, which could not see a
+cluster of artefacts valued at one bogus reference price, contributed by
+[@C-09-07](https://github.com/C-09-07) after running the tool on Plasma. Clean
+and single-outlier windows print byte-identical output. Our own readiness
+reports also moved out of the repository.
 
 - **A cluster of valuation artefacts is caught, not only a single outlier.** The 0.11.1
   `winner surplus plausible` rule tested each attempted auction against the rest of the window
