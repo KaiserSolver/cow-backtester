@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.11.3 — 2026-09-26
+
+The `--readiness --compete` upper-bound line now shows the budget's floor and tail, prompted by
+ZeroNine's Plasma run. No other output changes.
 
 - **The original-deadline upper bound prints its floor and tail.** `--readiness --compete` reports now show
   p5 / p50 / p95 / p99 and the minimum and maximum of `original_deadline − auctionStartBlock timestamp`
