@@ -1653,7 +1653,11 @@ def readiness_report(st, args):
     span_hours = ((span_end - span_start) / 3600.0
                   if span_src and span_end > span_start else None)
     bu = sorted(st.get("budget_upper") or [])
-    upper = ({"p50_s": _percentile(bu, 0.5), "p95_s": _percentile(bu, 0.95), "n": len(bu),
+    # p5 / min show whether a chain has a hard budget floor (Plasma: 5.237 s, reported by
+    # ZeroNine 2026-09-26), p99 / max its tail; same index convention as the p50 / p95.
+    upper = ({"p5_s": _percentile(bu, 0.05), "p50_s": _percentile(bu, 0.5),
+              "p95_s": _percentile(bu, 0.95), "p99_s": _percentile(bu, 0.99),
+              "min_s": bu[0], "max_s": bu[-1], "n": len(bu),
               "basis": "original_deadline minus auctionStartBlock timestamp (upper bound)"}
              if bu else None)
     clamped = (st.get("agg") or {}).get("validto_clamped_auctions", 0)
@@ -1915,8 +1919,9 @@ def readiness_report(st, args):
         print(f"  budget  : {budget_s:.3f} s ({budget_source}"
               + (f", BUDGETS_S[{chain}].settle" if budget_source == "observed" else "")
               + ")"
-              + (f" | original-deadline upper bound p50 {upper['p50_s']:.3f} s / p95 "
-                 f"{upper['p95_s']:.3f} s over {upper['n']} attempted"
+              + (f" | original-deadline upper bound p5 {upper['p5_s']:.3f} / p50 {upper['p50_s']:.3f} / "
+                 f"p95 {upper['p95_s']:.3f} / p99 {upper['p99_s']:.3f} s, min {upper['min_s']:.3f} / "
+                 f"max {upper['max_s']:.3f} s over {upper['n']} attempted"
                  if upper else " | original-deadline upper bound n/a (needs --compete)"))
         ov = {k for k, v in thr_src.items() if v == "override"}
         print(f"  thresholds: profile '{profile}' — "

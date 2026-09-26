@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **The original-deadline upper bound prints its floor and tail.** `--readiness --compete` reports now show
+  p5 / p50 / p95 / p99 and the minimum and maximum of `original_deadline − auctionStartBlock timestamp`
+  (the JSON's `original_budget_upper_s` gains `p5_s`, `p99_s`, `min_s`, `max_s`). A hard budget floor is now
+  visible: Plasma's sits at 5.237 s over 520 auctions, reported by ZeroNine (2026-09-26). Same index
+  convention as the existing p50 / p95.
+
 ## 0.11.2 — 2026-09-23
 
 A fix to the 0.11.1 winner-surplus sanity check, which could not see a

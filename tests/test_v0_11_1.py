@@ -413,3 +413,22 @@ def test_meta_line_marks_the_artefact_auction(monkeypatch, tmp_path):
     assert meta["v"] == backtest.VERSION
     assert meta["winner_surplus_artefacts"] == [
         {"auction_id": ARTEFACT_ID, "winner_surplus_wei": 10**7, "ratio": 434.8}]
+
+
+# --------------------------------------- upper-bound budget: floor and tail (09-26)
+
+def test_upper_bound_reports_p5_min_p99_max(capsys):
+    """The original-deadline upper bound prints its floor (p5, min) and tail (p99, max)
+    beside p50 / p95, so a hard floor like Plasma's 5.237 s shows up in the report."""
+    rows = _normal_rows(20)
+    st = _state(rows)
+    st["budget_upper"] = sorted([5.237 + 0.01 * i for i in range(99)] + [10.564])
+    rep = backtest.readiness_report(st, _args())[0]
+    up = rep["original_budget_upper_s"]
+    assert up["n"] == 100 and up["min_s"] == 5.237 and up["max_s"] == 10.564
+    assert up["p5_s"] == pytest.approx(5.287) and up["p99_s"] == 10.564
+    assert up["p50_s"] == pytest.approx(5.737) and up["p95_s"] == pytest.approx(6.187)
+    out = capsys.readouterr().out
+    assert "original-deadline upper bound p5 5.287 / p50 5.737 / p95 6.187 / p99 10.564 s" in out
+    assert "min 5.237 / max 10.564 s over 100 attempted" in out
+
