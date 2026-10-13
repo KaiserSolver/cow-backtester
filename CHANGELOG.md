@@ -1,15 +1,20 @@
 # Changelog
 
-## 0.11.3 — 2026-09-26
+## 0.11.3 — 2026-10-13
 
 The `--readiness --compete` upper-bound line now shows the budget's floor and tail, prompted by
-ZeroNine's Plasma run. No other output changes.
+ZeroNine's Plasma run. No other output changes. (The code change is from 2026-09-26; this is its
+first release.)
 
 - **The original-deadline upper bound prints its floor and tail.** `--readiness --compete` reports now show
   p5 / p50 / p95 / p99 and the minimum and maximum of `original_deadline − auctionStartBlock timestamp`
   (the JSON's `original_budget_upper_s` gains `p5_s`, `p99_s`, `min_s`, `max_s`). A hard budget floor is now
   visible: Plasma's sits at 5.237 s over 520 auctions, reported by ZeroNine (2026-09-26). Same index
   convention as the existing p50 / p95.
+- **README matches the code.** The readiness section now describes the six metrics, the guard lines
+  and the 500-auction floor as in forum thread t/3572. It states that observed driver budgets ship for
+  Arbitrum, Base and BNB, and that other chains need `--solve-timeout` (the old text said readiness works
+  on any supported chain). It shows the published 2026-10-12 Base screen and links the readiness record.
 
 ## 0.11.2 — 2026-09-23
 

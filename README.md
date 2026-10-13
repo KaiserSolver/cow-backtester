@@ -51,65 +51,75 @@ API (`POST /solve`).
 If you are bringing up a new solver and want a fast "is this endpoint healthy
 enough to face production auctions?" read, `--readiness` prints a one-screen
 report instead of the full field scorecard. We hold ourselves to it: our own
-solvers' reports, run past the 500-auction floor with 0.11.0 on 2026-09-14, were
-kept under `docs/readiness/` here until 2026-09-21 and now live in a separate,
-checksummed record of their own (`KaiserSolver/kaisersolver-readiness`). This
-repository ships the tool; that one is one solver's record of applying it to
-itself. The versions cited on the forum remain in this repository's history at
-commit `e7b3b73` (`git show e7b3b73:docs/readiness/kaisersolver-base-2026-09-14.md`).
+solvers' reports (2026-09-14 with 0.11.0, 2026-10-12 with 0.11.2, one run per chain
+per month) are published with checksums in their own record:
+[KaiserSolver/kaisersolver-readiness](https://github.com/KaiserSolver/kaisersolver-readiness).
+This repository ships the tool; that one is one solver's record of applying it to
+itself. The reports were kept under `docs/readiness/` here until 2026-09-21; the
+versions cited on the forum remain in this repository's history at commit `e7b3b73`
+(`git show e7b3b73:docs/readiness/kaisersolver-base-2026-09-14.md`).
 
 ```bash
 cow-backtester --chain base --blocks 2000 --rpc-url <your-rpc> \
         --solver-url http://localhost:8080 --solver-name mine --readiness
 ```
 
-It replays recent auctions against your endpoint and reports up to eleven
-checks across four dimensions — does it answer, is it fast enough, are its
-solutions valid, are they competitive with the on-chain winners — plus how
-complete the field it was measured against actually was, as pass/warn checks
-with a `READY` / `REVIEW` / `NOT READY` verdict. Real output, our own Base solver,
-a 300-block run on 2026-09-14 with 0.11.0 (RPC redacted, nothing else):
+It replays recent auctions against your endpoint, each stamped with the driver's
+per-request budget for the chain, and reports six metrics: answer rate, transport errors,
+deadline misses, solve latency against the budget, solution validity (feasibility, uniform
+prices and the CIP-67 fairness filter) and capture of the on-chain winners' surplus. Each is a
+PASS / WARN / FAIL line. Guard lines (bid coverage, price plausibility, scan coverage, field
+coverage) can warn but never fail. The verdict is `READY` when every line passes on at least
+500 attempted auctions in an uncapped sample, `NOT READY` when any line fails, and `REVIEW`
+otherwise. Definitions and thresholds:
+[Measuring solver readiness before production](https://forum.cow.fi/t/measuring-solver-readiness-before-production-a-v0-proposal/3572)
+(t/3572).
+
+Real output, our own Base solver: the published 2026-10-12 report, 1,210 auctions over
+13 h with 0.11.2 (the record redacts the solver URL and the archive path):
 
 ```
 ====================================================================
   READINESS — kaisersolver   [REVIEW]
-  base · prod · blocks 51302436..51302735
+  base · prod · blocks 52507014..52530697
 ====================================================================
-  window  : blocks 51302436..51302735 | attempted auctions span 2026-09-14T13:57:09Z → 2026-09-14T14:06:25Z (0.15 h, settlement-block timestamps; 187.77 attempted/h)
-            settlements found 32 / auctions formed 29 / attempted 29 / replayed 29 / returned 7
-            excluded 0
-  budget  : 4.620 s (observed, BUDGETS_S[base].settle) | original-deadline upper bound n/a (needs --compete)
+  window  : blocks 52507014..52530697 | attempted auctions span 2026-10-12T11:10:01Z → 2026-10-13T00:18:33Z (13.14 h, auctionStartBlock timestamps; 92.07 attempted/h)
+            settlements found 1363 / auctions formed 1218 / attempted 1210 / replayed 1210 / returned 871
+            excluded 37 — top: [('wrapper_unattributed', 20), ('tx_uid_mismatch', 10), ('body_uid_mismatch', 6)]
+  budget  : 4.620 s (observed, BUDGETS_S[base].settle) | original-deadline upper bound p50 5.655 s / p95 9.730 s over 1194 attempted
   thresholds: profile 'default' — answer_rate >=90/50% · transport 0/<=1% · deadline_miss 0/<=1% · latency p95 <=0.5x/1x budget · validity >=90/50% · capture >=50/>0% · min_evidence 500
-  INSUFFICIENT SAMPLE (attempted 29 < 500)
-  [PASS] reached auctions         29 auctions attempted
+  [PASS] reached auctions         1210 auctions attempted
   [PASS] no transport errors      0 transport errors
   [PASS] answers reliably         100% returned a parseable response inside the budget (incl. legitimate empty solutions)
-  [WARN] bid coverage             24% of answered auctions carried >=1 solution
+  [PASS] bid coverage             72% of answered auctions carried >=1 solution
   [PASS] inside the deadline      0 deadline misses
-  [PASS] latency headroom         p95 1107 ms of a 4620 ms budget (observed); PASS <= 0.5x, WARN <= 1x
-  [PASS] solutions are valid      100% of bid auctions had >=1 valid solution [feasibility+eligibility+udcp+fairness:not-evaluated; fairness_filtered 0, zero_surplus 0, udcp 25 checked / 0 violations]
-  [PASS] competitive vs winners   91% of winner surplus captured (coverage-adjusted; 91% conditional on answering; basis mix {'exact_uniform': 23, 'wrapper_lower_bound': 6})
+  [WARN] latency headroom         p95 2968 ms of a 4620 ms budget (observed); PASS <= 0.5x, WARN <= 1x
+  [PASS] solutions are valid      100% of bid auctions had >=1 valid solution [feasibility+eligibility+udcp+fairness:partial(859/871 evaluated); fairness_filtered 30, zero_surplus 0, udcp 2995 checked / 0 violations]
+  [PASS] competitive vs winners   83% of winner surplus captured (coverage-adjusted; 83% conditional on answering; basis mix {'mixed': 53, 'exact_uniform': 919, 'wrapper_lower_bound': 238})
+  [WARN] prices look plausible    96 auction(s) flagged implausible_surplus
   [PASS] scan coverage            every block in the window was scanned
-  [PASS] field coverage           32 settlements, 29 auctions formed, 0 excluded (0% of field; top reasons [])
+  [PASS] field coverage           1363 settlements, 1218 auctions formed, 37 excluded (3% of field; top reasons [('wrapper_unattributed', 20), ('tx_uid_mismatch', 10), ('body_uid_mismatch', 6)])
   ----------------------------------------------------------------
-  answered            : 29/29  (100%)   bids: 7   transport: 0   deadline misses: 0
-  latency             : p50 348 ms / p95 1107 ms / max 1460 ms   (budget 4620 ms; answered-only incl. late answers)
-  surplus vs winners  : 91% captured (coverage-adjusted) / 91% conditional   (7/29 valid)
-  winner basis mix    : {'exact_uniform': 23, 'wrapper_lower_bound': 6}
-  validity basis      : feasibility+eligibility+udcp+fairness:not-evaluated
+  answered            : 1210/1210  (100%)   bids: 871   transport: 0   deadline misses: 0
+  latency             : p50 1615 ms / p95 2968 ms / max 3607 ms   (budget 4620 ms; answered-only incl. late answers)
+  surplus vs winners  : 83% captured (coverage-adjusted) / 83% conditional   (871/1210 valid)
+  per-bid median      : 0.969x ours/winner over 775 unflagged bid auction(s)
+  winner basis mix    : {'mixed': 53, 'exact_uniform': 919, 'wrapper_lower_bound': 238}
+  validity basis      : feasibility+eligibility+udcp+fairness:partial(859/871 evaluated)
 
   Reproduce this run:
-    cow-backtester --chain base --env prod --from-block 51302436 --to-block 51302735 --bodies-dir <bodies-dir: rerun with --archive-bodies DIR to make this reproducible> --solve-timeout 4.62 --min-evidence 500 \
-        --rpc-url <rpc> --solver-url http://127.0.0.1:11090/prod/base --solver-name kaisersolver --readiness
-    # cow-backtester 0.11.0 · engine build sha: <fill in: the endpoint's boot-line git_sha (not exposed over /solve)>
+    cow-backtester --chain base --env prod --from-block 52507014 --to-block 52530697 --bodies-dir <archive> --solve-timeout 4.62 --min-evidence 500 --compete \
+        --rpc-url <rpc> --solver-url <solver-url> --solver-name kaisersolver --readiness
+    # cow-backtester 0.11.2 · engine build sha: cf57bd616
 
   Note: replays live liquidity against archived auctions — a readiness
   signal, not a settlement guarantee. Pair with self-hosted shadow before prod.
 ```
 
-Twenty-nine auctions is a smoke test, not evidence: the verdict is held at REVIEW by the
-500-auction floor no matter how the checks read, and the header says so. The full-window
-reports, run past the floor on all three chains the same day, are the three files linked above.
+1,210 attempted auctions clear the 500-auction floor; the verdict is REVIEW because two lines
+warn and none fails. 0.11.3 prints the same screen with p5 / p99 / min / max added to the
+original-deadline upper bound on the `budget` line. All three chains' reports are in the
+[record](https://github.com/KaiserSolver/kaisersolver-readiness).
 
 Two readings the sum-weighted capture hides (0.11.1). When one auction's decoded
 winner surplus exceeds 100× the rest of the window combined it is a reference-price
@@ -130,10 +140,11 @@ It prints the exact `--from-block/--to-block` command to reproduce the run,
 and the same data lands in `--json-out`/`--html-out` under `readiness`
 (including `unscanned_blocks` and every skip reason). `--fail-on not-ready`
 (or `review`) turns it into a CI gate: exit code 4 when the verdict trips.
-The screen prints even under `--quiet`, which silences progress only. Works
-on any of the supported chains, so you can readiness-check an endpoint for a
-chain you are not yet onboarded on. It is a signal, not a settlement
-guarantee — pair it with a self-hosted shadow run before going to production.
+The screen prints even under `--quiet`, which silences progress only. Observed
+driver budgets ship for Arbitrum, Base and BNB. On the other supported chains, pass the
+driver's budget with `--solve-timeout`; the tool refuses to measure against an assumed one.
+It is a signal, not a settlement guarantee — pair it with a self-hosted shadow run before
+going to production.
 
 ## Consistency economics (`--reward-ev`)
 
