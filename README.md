@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/cow-backtester)](https://pypi.org/project/cow-backtester/)
 
 Offline backtester, A/B harness, and counterfactual scorecard for CoW Protocol
-solvers.
+solvers. Built by [KaiserSolver](https://github.com/KaiserSolver), operated by [Fiftysix](https://fiftysix.tech).
 
 Point it at your own solver's `/solve` endpoint and it replays recent CoW
 auctions against it, then scores each of your solutions against the set of
