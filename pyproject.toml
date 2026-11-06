@@ -23,6 +23,8 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://fiftysix.tech/solver/cow-backtester/"
+Documentation = "https://github.com/KaiserSolver/cow-backtester/blob/main/README.md"
 Repository = "https://github.com/kaisersolver/cow-backtester"
 Issues = "https://github.com/kaisersolver/cow-backtester/issues"
 Changelog = "https://github.com/kaisersolver/cow-backtester/blob/main/CHANGELOG.md"
